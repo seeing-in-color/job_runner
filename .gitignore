@@ -39,3 +39,9 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Local uv toolchain (do not commit)
+.uv/
+
+# Personal resume dumps in repo root
+Resume_*.pdf
