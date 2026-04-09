@@ -592,11 +592,13 @@ def run_tailoring_legacy(min_score: int = 7, limit: int = 20,
 
 def _keywords_from_job(job: dict) -> list[str]:
     """Extract keyword list from score_reasoning first line; fallback to title tokens."""
+    from applypilot.scoring.scorer import parse_stored_score_reasoning
+
     sr = str(job.get("score_reasoning") or "").strip()
     if sr:
-        first = sr.splitlines()[0].strip()
-        if first:
-            parts = [p.strip() for p in first.split(",") if p.strip()]
+        kw_line = parse_stored_score_reasoning(sr)["keywords"].strip()
+        if kw_line:
+            parts = [p.strip() for p in kw_line.split(",") if p.strip()]
             if parts:
                 return parts[:16]
     title = str(job.get("title") or "").strip()

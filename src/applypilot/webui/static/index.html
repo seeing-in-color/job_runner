@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ApplyPilot</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <h1>ApplyPilot</h1>
+          <div class="ver" id="app-version">…</div>
+        </div>
+        <button type="button" class="nav-btn active" data-section="dashboard">Dashboard</button>
+        <button type="button" class="nav-btn" data-section="find">Find jobs</button>
+        <button type="button" class="nav-btn" data-section="score">Score</button>
+        <button type="button" class="nav-btn" data-section="results">Results</button>
+        <button type="button" class="nav-btn" data-section="settings">Settings</button>
+      </aside>
+      <main>
+        <div class="top-actions">
+          <div class="cost-tile" id="cost-tile" title="Estimated LLM spend from recorded token usage">
+            <div class="cost-tile__label">Est. API spend</div>
+            <div class="cost-tile__row">
+              <span class="cost-tile__value" id="cost-value">—</span>
+              <span class="cost-tile__meta" id="cost-meta"></span>
+            </div>
+          </div>
+          <div class="top-actions__right">
+            <button type="button" class="btn btn-ghost" id="btn-restart" title="Free the UI port and start applypilot ui again">
+              Restart server
+            </button>
+          </div>
+        </div>
+
+        <section id="section-dashboard" class="section active">
+          <h2>Dashboard</h2>
+          <p class="lead">Pipeline snapshot from your local database. Run <strong>discover</strong> from <strong>Find jobs</strong> or score from your terminal.</p>
+          <div id="dash-stats" class="grid-stats"></div>
+          <p class="status-bar" id="dash-status"></p>
+        </section>
+
+        <section id="section-find" class="section">
+          <h2>Find jobs</h2>
+          <p class="lead find-lead">
+            <code>searches.yaml</code> · main title + additional lines each get a keyword; upload a résumé per keyword on the
+            keyword you type.
+          </p>
+
+          <div class="find-compact panel">
+            <div class="find-compact__grid">
+              <div class="find-compact__block">
+                <div class="find-compact__h">Boards</div>
+                <div id="find-boards" class="chk-grid chk-grid--tight"></div>
+              </div>
+              <div class="find-compact__block">
+                <div class="find-compact__h">Sources</div>
+                <label class="find-inline"><input type="checkbox" id="find-run-jobspy" checked /> JobSpy boards</label>
+                <label class="find-inline"><input type="checkbox" id="find-run-workday" checked /> Workday</label>
+                <label class="find-inline"><input type="checkbox" id="find-run-smartextract" checked /> Smart extract</label>
+              </div>
+              <div class="find-compact__block">
+                <div class="find-compact__h">Location</div>
+                <label class="find-inline">City <input type="text" id="find-city" placeholder="Austin, TX" class="find-input-sm" /></label>
+                <label class="find-inline"><input type="checkbox" id="find-include-remote" checked /> Remote</label>
+              </div>
+            </div>
+
+            <label class="find-compact__terms-label">Main job title <span class="find-hint">(primary search)</span></label>
+            <input
+              type="text"
+              id="find-main-title"
+              class="find-input-main"
+              spellcheck="false"
+              placeholder="e.g. Staff Software Engineer"
+            />
+            <label class="find-compact__terms-label" style="margin-top: 0.65rem">Additional titles <span class="find-hint">(one per line)</span></label>
+            <textarea id="find-additional-titles" class="find-ta find-ta--main" rows="4" spellcheck="false" placeholder="Extra search queries…"></textarea>
+
+            <div class="find-compact__resumes">
+              <div class="find-compact__h">Résumés <span class="find-hint">optional · uploads when you pick a file</span></div>
+              <label class="find-inline find-inline--mb"
+                ><input type="checkbox" id="find-resume-all-keywords" /> Same file for every keyword</label
+              >
+              <div class="find-upload-row">
+                <input
+                  type="text"
+                  id="upload-keyword"
+                  placeholder="Exact main or additional title"
+                  class="find-input-keyword"
+                  title="Must match main job title or a line under Additional titles"
+                />
+                <input type="file" id="upload-file" accept=".pdf,.txt,.doc,.docx" />
+              </div>
+              <p class="status-bar" id="upload-status"></p>
+            </div>
+
+            <div class="find-compact__limits">
+              <label>Per board <input type="number" id="find-results-per-site" min="1" max="500" value="100" class="find-num" /></label>
+              <label>Hours ≤ <input type="number" id="find-hours-old" min="1" max="720" value="72" class="find-num" /></label>
+              <label>Country <input type="text" id="find-country" value="USA" class="find-num" /></label>
+            </div>
+
+            <div class="find-compact__actions">
+              <button type="button" class="btn" id="btn-save-find">Save</button>
+              <button type="button" class="btn" id="btn-run-discover" title="Save, then run discover with the sources checked above">Run discover</button>
+              <span class="status-bar" id="find-status"></span>
+            </div>
+          </div>
+        </section>
+
+        <section id="section-score" class="section">
+          <h2>Score</h2>
+          <p class="lead">
+            Criteria in <code>scoring_criteria.json</code>; role résumés apply per discovery keyword. Save, then
+            <strong>Run score</strong>.
+          </p>
+          <div class="panel">
+            <h3>Criteria</h3>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-relevance" /> Search relevance vs discovery keyword</label>
+            </div>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-seniority" /> Seniority / years alignment</label>
+            </div>
+            <div class="form-row">
+              <label>Profile years: <input type="number" id="crit-years" min="0" max="60" step="1" /></label>
+            </div>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-travel" /> Drop &gt;25% travel before scoring</label>
+            </div>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-skills-gap" /> Strict required-skills gap</label>
+            </div>
+            <div class="form-row">
+              <label
+                ><input type="checkbox" id="crit-uploads-only" /> Only use uploaded keyword résumés (skip jobs with no
+                matching file; do not use profile <code>resume.txt</code>)</label
+              >
+            </div>
+            <div class="form-row">
+              <button type="button" class="btn" id="btn-save-criteria">Save</button>
+              <button type="button" class="btn" id="btn-run-score" title="Save criteria, then run the score stage (same as applypilot run score)">
+                Run score
+              </button>
+              <span class="status-bar" id="score-status"></span>
+            </div>
+          </div>
+        </section>
+
+        <section id="section-results" class="section">
+          <h2>Results</h2>
+          <p class="lead">
+            Open <strong>Why</strong> for per-criterion scores. <span class="find-hint">*</span> next to a title means that
+            listing was found with a search keyword that has a role-specific résumé uploaded.
+          </p>
+          <div class="form-row results-toolbar" style="margin-bottom: 0.75rem; flex-wrap: wrap; align-items: center">
+            <input type="search" id="filter-q" placeholder="Search title…" style="min-width: 180px" />
+            <select id="filter-site"><option value="">All sites</option></select>
+            <input type="number" id="filter-min" placeholder="Min score" min="0" max="10" style="width: 6rem" />
+            <select id="filter-track">
+              <option value="">Any status</option>
+              <option value="unset">No status</option>
+              <option value="open">Open</option>
+              <option value="applied">Applied</option>
+              <option value="follow_up">Follow-up Required</option>
+              <option value="interview">Interview</option>
+            </select>
+            <label class="results-sort-label"
+              >Sort
+              <select id="results-sort">
+                <option value="score_desc">Score (high → low)</option>
+                <option value="score_asc">Score (low → high)</option>
+                <option value="title_asc">Title (A–Z)</option>
+                <option value="title_desc">Title (Z–A)</option>
+                <option value="site_asc">Site (A–Z)</option>
+                <option value="site_desc">Site (Z–A)</option>
+                <option value="discovered_desc">Newest first</option>
+                <option value="discovered_asc">Oldest first</option>
+                <option value="track_asc">Status (A–Z)</option>
+                <option value="track_desc">Status (Z–A)</option>
+              </select></label
+            >
+            <button type="button" class="btn" id="btn-results-refresh">Refresh</button>
+            <span class="results-toolbar__spacer" aria-hidden="true"></span>
+            <button type="button" class="btn btn-danger" id="btn-delete-scored" title="Remove rows that have a fit score">
+              Delete scored
+            </button>
+            <button type="button" class="btn btn-danger" id="btn-delete-all-jobs" title="Remove every job row">
+              Delete all jobs
+            </button>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>Title</th>
+                  <th>Site</th>
+                  <th>Score</th>
+                  <th>Job search</th>
+                  <th>Track</th>
+                  <th>Why</th>
+                </tr>
+              </thead>
+              <tbody id="results-tbody"></tbody>
+            </table>
+            <div id="results-sentinel" class="results-sentinel" aria-hidden="true"></div>
+          </div>
+          <p class="status-bar" id="results-status"></p>
+        </section>
+
+        <section id="section-settings" class="section">
+          <h2>Settings</h2>
+          <p class="lead">Paths and tier. API keys live in <code>~/.applypilot/.env</code> (not shown here).</p>
+          <p id="settings-tier" style="color: var(--muted)"></p>
+          <div class="panel paths-list" id="settings-paths"></div>
+          <div class="panel" id="settings-resumes-panel">
+            <h3>Role résumés</h3>
+            <p class="hint">Uploaded files and the search keywords that use each file.</p>
+            <div id="settings-resumes" class="settings-resumes"></div>
+            <p class="status-bar" id="settings-resumes-status"></p>
+          </div>
+          <div class="form-row">
+            <button type="button" class="btn" id="btn-export-html">Export HTML dashboard</button>
+            <span class="status-bar" id="settings-export-status"></span>
+          </div>
+          <p class="lead" style="margin-top: 1rem">
+            After code changes, use <strong>Restart server</strong> if the UI port is stuck or the app is stale.
+          </p>
+        </section>
+      </main>
+    </div>
+
+    <div id="terminal-dock" class="terminal-dock" aria-label="Command output">
+      <div class="terminal-dock__bar">
+        <span class="terminal-dock__title">Terminal</span>
+        <div class="terminal-dock__actions">
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-stop" title="Stop the running discover or score process">Stop</button>
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-clear" title="Clear output">Clear</button>
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-toggle" title="Show or hide output">Hide</button>
+        </div>
+      </div>
+      <pre id="terminal-output" class="terminal-dock__output" spellcheck="false"></pre>
+    </div>
+
+    <div id="modal-why" class="modal-overlay" role="dialog" aria-modal="true">
+      <div class="modal modal-why">
+        <header>
+          <h3>Why this score</h3>
+          <button type="button" class="btn btn-ghost" id="modal-why-close">Close</button>
+        </header>
+        <div class="body" id="modal-why-body"></div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -21,6 +21,13 @@ from applypilot.database import get_connection, get_jobs_by_stage, init_db
 from applypilot.discovery.travel_filter import is_excessive_travel_requirement
 from applypilot.llm import get_client
 from applypilot.resume import ensure_clean_resume_text
+from applypilot.scoring.criteria import (
+    ScoringCriteria,
+    build_scoring_system_prompt,
+    clip_search_query_for_prompt,
+    load_scoring_criteria,
+)
+from applypilot.scoring.role_resume import resolve_resume_text_for_job, uses_role_upload_for_scoring
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -623,8 +630,13 @@ def _token_or_phrase_in_resume(phrase: str, resume_lower: str) -> bool:
     )
 
 
-def _build_identity_block(profile: dict) -> list[str]:
-    """Compact identity from profile only (no invented titles or skills)."""
+def _build_identity_block(profile: dict, *, search_query: str | None = None) -> list[str]:
+    """Compact identity from profile only (no invented titles or skills).
+
+    When ``search_query`` is set (job discovery keyword), it is the authoritative target role for
+    this score; profile ``target_role`` is omitted to avoid conflicting stale titles (e.g. from
+    profile.json history).
+    """
     lines: list[str] = []
     personal = profile.get("personal") or {}
     exp = profile.get("experience") or {}
@@ -641,9 +653,14 @@ def _build_identity_block(profile: dict) -> list[str]:
     elif location_flat:
         lines.append(f"Location: {location_flat}")
 
-    tr = _clean_profile_text(exp.get("target_role") or profile.get("target_role"))
-    if tr:
-        lines.append(f"Target role: {tr}")
+    _raw_sq = None if search_query is None else (str(search_query).strip() or None)
+    sq = clip_search_query_for_prompt(_raw_sq)
+    if sq:
+        lines.append(f"Target role (this search): {sq}")
+    else:
+        tr = _clean_profile_text(exp.get("target_role") or profile.get("target_role"))
+        if tr:
+            lines.append(f"Target role: {tr}")
     cjt = _clean_profile_text(exp.get("current_job_title"))
     if cjt:
         lines.append(f"Recent title: {cjt}")
@@ -659,6 +676,22 @@ def _build_identity_block(profile: dict) -> list[str]:
     summary = _clean_profile_text(profile.get("summary"))
     if summary:
         lines.append(f"Summary: {summary}")
+    return lines
+
+
+def _build_identity_minimal_for_role_upload(
+    search_query: str | None,
+    *,
+    criteria: ScoringCriteria | None,
+) -> list[str]:
+    """Identity lines when scoring from an uploaded keyword résumé only (no profile.json clutter)."""
+    lines: list[str] = []
+    _raw_sq = None if search_query is None else (str(search_query).strip() or None)
+    sq = clip_search_query_for_prompt(_raw_sq)
+    if sq:
+        lines.append(f"Target role (this search): {sq}")
+    if criteria and criteria.seniority:
+        lines.append(f"Years experience (for seniority): {criteria.years_experience}")
     return lines
 
 
@@ -842,11 +875,25 @@ def _resume_snippet_for_profile(resume_text: str, max_chars: int) -> str:
     return combined[:max_chars].rstrip()
 
 
-def build_condensed_candidate_profile(resume_text: str, profile: dict | None) -> tuple[str, int, int]:
+def build_condensed_candidate_profile(
+    resume_text: str,
+    profile: dict | None,
+    *,
+    search_query: str | None = None,
+    from_role_upload: bool = False,
+    criteria: ScoringCriteria | None = None,
+) -> tuple[str, int, int]:
     """Build a ≤3000 char profile: identity, structured resume, then verified profile lines.
 
     ``skills_boundary`` and ``resume_facts`` are included only when each entry
     appears in ``resume.txt`` (no inferred or free-floating skill lists).
+
+    ``search_query`` is the Find jobs / discovery keyword for this row; when set, it overrides any
+    stale ``target_role`` from ``profile.json`` in the identity block.
+
+    When ``from_role_upload`` is True, **profile.json** is not merged in (no summary, old target role,
+    profile skills/notable blocks) — only the uploaded file text (structured excerpt) plus the discovery
+    keyword and criteria years for seniority.
 
     Returns ``(profile_text, original_resume_len, final_profile_len)``.
     """
@@ -854,20 +901,25 @@ def build_condensed_candidate_profile(resume_text: str, profile: dict | None) ->
     rt = (resume_text or "").strip()
     resume_lower = rt.lower()
 
-    identity_lines = _build_identity_block(p)
+    if from_role_upload:
+        identity_lines = _build_identity_minimal_for_role_upload(search_query, criteria=criteria)
+        skills_block = ""
+        highlights_block = ""
+    else:
+        identity_lines = _build_identity_block(p, search_query=search_query)
+        skills_inner = _skills_boundary_matching_resume(p, resume_lower)
+        skills_block = ""
+        if skills_inner:
+            skills_block = "PROFILE SKILLS (also in resume text)\n" + skills_inner
+
+        highlights_inner = _resume_facts_matching_resume(p, resume_lower)
+        highlights_block = ""
+        if highlights_inner:
+            highlights_block = "NOTABLE (from profile; text appears in resume)\n" + highlights_inner
+
     identity_block = ""
     if identity_lines:
         identity_block = "IDENTITY\n" + "\n".join(identity_lines)
-
-    skills_inner = _skills_boundary_matching_resume(p, resume_lower)
-    skills_block = ""
-    if skills_inner:
-        skills_block = "PROFILE SKILLS (also in resume text)\n" + skills_inner
-
-    highlights_inner = _resume_facts_matching_resume(p, resume_lower)
-    highlights_block = ""
-    if highlights_inner:
-        highlights_block = "NOTABLE (from profile; text appears in resume)\n" + highlights_inner
 
     # Reserve space for fixed sections; give the rest to the resume excerpt.
     sep = 2
@@ -904,29 +956,79 @@ def build_condensed_candidate_profile(resume_text: str, profile: dict | None) ->
     return body, resume_in_len, out_len
 
 
-# ── Scoring Prompt ────────────────────────────────────────────────────────
+def parse_stored_score_reasoning(sr: str | None) -> dict[str, str]:
+    """Split ``jobs.score_reasoning`` into keywords, optional criteria table, and reasoning (any format)."""
+    raw = (sr or "").strip()
+    if not raw:
+        return {"keywords": "", "reasoning": "", "criteria_table": "", "raw": ""}
 
-SCORE_PROMPT = """You score how well the CANDIDATE PROFILE fits the JOB POSTING.
+    split_r = re.split(r"(?m)^REASONING:\s*", raw, maxsplit=1)
+    before = split_r[0].strip()
+    reasoning = split_r[1].strip() if len(split_r) > 1 else ""
 
-The posting is organized into weighted sections (when present):
+    keywords = ""
+    criteria_table = ""
+    if "CRITERIA:" in before:
+        pre, _, after_crit = before.partition("CRITERIA:")
+        criteria_table = after_crit.strip() if after_crit.strip() else ""
+        pre_nonempty = [ln.strip() for ln in pre.splitlines() if ln.strip()]
+        if pre_nonempty:
+            keywords = pre_nonempty[0]
+    else:
+        lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
+        if lines:
+            keywords = lines[0]
+        if len(lines) > 1 and not reasoning:
+            reasoning = "\n".join(lines[1:])
 
-1) **Required qualifications** — HIGHEST weight. These are must-haves (skills, years, education, licenses, core tools). If the candidate clearly satisfies **most** of the stated requirements, the score should be **at least 6–7** unless there is a **disqualifying** gap (e.g. a hard requirement they completely lack, such as a required license or mandatory technology they have zero experience with).
+    return {
+        "keywords": keywords,
+        "reasoning": reasoning,
+        "criteria_table": criteria_table,
+        "raw": raw,
+    }
 
-2) **Responsibilities** — MEDIUM weight. Compare the candidate's experience to what they would do day-to-day; this should move the score up or down in the mid range when combined with required fit.
 
-3) **Preferred qualifications** — LOW weight. Treat as bonuses only. **Missing preferred / nice-to-have items must NOT pull the score below the mid range (5–6) by themselves** and must NOT dominate the score. Do not apply a large penalty solely for gaps in preferred items when required qualifications are largely met.
+def parse_criteria_table_rows(criteria_table: str) -> list[dict[str, str]]:
+    """Parse pipe-delimited CRITERIA lines (``Label|score|note``) into row dicts for UI tables."""
+    out: list[dict[str, str]] = []
+    for line in (criteria_table or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 2)
+        if len(parts) >= 3:
+            out.append(
+                {
+                    "label": parts[0].strip(),
+                    "score": parts[1].strip(),
+                    "note": parts[2].strip(),
+                }
+            )
+        elif len(parts) == 2:
+            out.append({"label": parts[0].strip(), "score": parts[1].strip(), "note": ""})
+        else:
+            out.append({"label": line, "score": "", "note": ""})
+    return out
 
-**Calibration (apply in order):**
-- Strong match on required + reasonable alignment with responsibilities → typically **7–10**.
-- Meets most required items with no disqualifying gap → **minimum 6–7** unless you explicitly justify a rare exception in REASONING.
-- Weak required fit → scores can be **1–5**; cite the blocking gaps.
-- Prefer citing **required** fit first in REASONING, then responsibilities, then preferred items only briefly if useful.
 
-The candidate profile is intentionally short. Output exactly three lines:
-
-SCORE: [integer 1-10 only]
-KEYWORDS: [comma-separated ATS-relevant terms from the job that fit this candidate]
-REASONING: [2-4 sentences: required fit first, then responsibilities, then preferred if relevant]"""
+def _format_score_reasoning_for_db(result: dict) -> str:
+    """Serialize keywords + optional CRITERIA table + REASONING for ``jobs.score_reasoning``."""
+    kw = (result.get("keywords") or "").strip()
+    crit = (result.get("criteria_block") or "").strip()
+    reason = (result.get("reasoning") or "").strip()
+    parts: list[str] = []
+    parts.append(kw)
+    if crit:
+        parts.append("")
+        parts.append("CRITERIA:")
+        parts.append(crit)
+    parts.append("")
+    if reason:
+        parts.append(f"REASONING: {reason}")
+    else:
+        parts.append("REASONING:")
+    return "\n".join(parts).strip()
 
 
 def _parse_score_response(response: str) -> dict:
@@ -936,48 +1038,83 @@ def _parse_score_response(response: str) -> dict:
         response: Raw LLM response text (OpenAI ``message.content`` or Gemini text).
 
     Returns:
-        {"score": int, "keywords": str, "reasoning": str}
+        {"score": int, "keywords": str, "reasoning": str, "criteria_block": str}
     """
+    empty = {"score": 0, "keywords": "", "reasoning": "", "criteria_block": ""}
     if response is None or not str(response).strip():
-        return {"score": 0, "keywords": "", "reasoning": "Empty LLM response"}
+        return {**empty, "reasoning": "Empty LLM response"}
 
+    text = str(response).strip()
     score = 0
+    m_score = re.search(r"(?m)^SCORE:\s*(\d+)", text)
+    if m_score:
+        try:
+            score = max(1, min(10, int(m_score.group(1))))
+        except ValueError:
+            score = 0
+
     keywords = ""
-    reasoning = str(response)
+    m_kw = re.search(r"(?m)^KEYWORDS:\s*(.*)$", text)
+    if m_kw:
+        keywords = m_kw.group(1).strip()
 
-    for line in response.split("\n"):
-        line = line.strip()
-        if line.startswith("SCORE:"):
-            try:
-                score = int(re.search(r"\d+", line).group())
-                score = max(1, min(10, score))
-            except (AttributeError, ValueError):
-                score = 0
-        elif line.startswith("KEYWORDS:"):
-            keywords = line.replace("KEYWORDS:", "").strip()
-        elif line.startswith("REASONING:"):
-            reasoning = line.replace("REASONING:", "").strip()
+    criteria_block = ""
+    reasoning = ""
+    split_r = re.split(r"(?m)^REASONING:\s*", text, maxsplit=1)
+    before = split_r[0].strip()
+    if len(split_r) > 1:
+        reasoning = split_r[1].strip()
 
-    return {"score": score, "keywords": keywords, "reasoning": reasoning}
+    if "CRITERIA:" in before:
+        _, _, after_crit = before.partition("CRITERIA:")
+        criteria_block = after_crit.strip()
+    elif not reasoning and before:
+        # Legacy three-line output without a REASONING: header
+        lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
+        consumed = 0
+        if lines and lines[0].startswith("SCORE:"):
+            consumed += 1
+        if len(lines) > consumed and lines[consumed].startswith("KEYWORDS:"):
+            consumed += 1
+        tail = "\n".join(lines[consumed:])
+        if tail:
+            reasoning = tail
+
+    return {"score": score, "keywords": keywords, "reasoning": reasoning, "criteria_block": criteria_block}
 
 
 def score_job(
     candidate_profile: str,
     job: dict,
     *,
+    criteria: ScoringCriteria | None = None,
     verbose: bool = False,
 ) -> dict:
     """Score a single job against a **condensed** candidate profile (not full resume).
 
     Args:
         candidate_profile: Short profile text (identity, structured resume, verified lines), ≤ ~3000 chars.
-        job: Job dict with keys: title, site, location, full_description.
+        job: Job dict with keys: title, site, location, full_description, search_query (optional).
+        criteria: Scoring rubric toggles; loads from disk when omitted.
         verbose: If True, log prompt/essentials diagnostics (see ``SCORE_VERBOSE``).
 
     Returns:
-        {"score": int, "keywords": str, "reasoning": str}
+        {"score": int, "keywords": str, "reasoning": str, "criteria_block": str}
     """
     eff_verbose = verbose or SCORE_VERBOSE
+    crit = criteria if criteria is not None else load_scoring_criteria()
+    system_prompt = build_scoring_system_prompt(
+        crit,
+        for_search_query=job.get("search_query"),
+    )
+    if uses_role_upload_for_scoring(job):
+        system_prompt += (
+            "\n\n**Résumé for this search:** The **CANDIDATE PROFILE** below is built **only** from the résumé file "
+            "uploaded for this job's discovery keyword (`role_resumes/`), plus the discovery keyword and seniority "
+            "settings from scoring criteria. **Do not** treat `profile.json`, default `resume.txt` on disk, or past "
+            "search targets as evidence—compare the posting to the profile text below only. Apply the full rubric "
+            "(required qualifications, seniority, preferred, responsibilities, search relevance)."
+        )
     raw_desc = job.get("full_description") or ""
     desc_orig = len(str(raw_desc))
 
@@ -1009,11 +1146,23 @@ def score_job(
         f"JOB POSTING (weighted sections for scoring):\n{desc_body}"
     )
 
+    _jq = job.get("search_query")
+    sq_line = clip_search_query_for_prompt(
+        None if _jq is None else (str(_jq).strip() or None),
+    )
+    discovery_preamble = ""
+    if sq_line:
+        discovery_preamble = (
+            f"DISCOVERY KEYWORD (authoritative target role for this score — prioritize this over any "
+            f"other title/role line in the profile):\n{sq_line}\n\n"
+        )
+
     messages = [
-        {"role": "system", "content": SCORE_PROMPT},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
+                f"{discovery_preamble}"
                 f"CANDIDATE PROFILE:\n{candidate_profile}\n\n"
                 f"---\n\nJOB POSTING:\n{job_text}"
             ),
@@ -1022,11 +1171,11 @@ def score_job(
 
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        response = client.chat(messages, max_tokens=1024, temperature=0.2)
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}", "criteria_block": ""}
 
 
 def run_scoring(
@@ -1054,7 +1203,7 @@ def run_scoring(
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
     """
     eff_verbose = verbose or SCORE_VERBOSE
-    resume_text, resume_source_used = ensure_clean_resume_text()
+    criteria = load_scoring_criteria()
     profile = _load_profile_for_scoring()
     if not profile:
         console.print()
@@ -1068,18 +1217,37 @@ def run_scoring(
         )
     elif profile_has_placeholders(profile):
         print_profile_placeholder_warning()
-    candidate_profile, resume_chars, profile_chars = build_condensed_candidate_profile(
-        resume_text, profile
-    )
-    print_scoring_candidate_profile(candidate_profile)
-    if eff_verbose:
-        log.info(
-            "Condensed candidate profile for scoring: resume_input=%d chars -> profile=%d chars (max %d)",
-            resume_chars,
-            profile_chars,
-            SCORE_MAX_PROFILE_CHARS,
+
+    default_resume, default_resume_src = ensure_clean_resume_text()
+    if criteria.fallback_to_profile_resume:
+        candidate_profile_preview, resume_chars, profile_chars = build_condensed_candidate_profile(
+            default_resume,
+            profile,
+            search_query=None,
+            from_role_upload=False,
+            criteria=criteria,
         )
-        log.info("Resume source used for scoring: %s", resume_source_used)
+        print_scoring_candidate_profile(candidate_profile_preview)
+        if eff_verbose:
+            log.info(
+                "Condensed candidate profile (default résumé): resume_input=%d chars -> profile=%d chars (max %d)",
+                resume_chars,
+                profile_chars,
+                SCORE_MAX_PROFILE_CHARS,
+            )
+            log.info("Default résumé source for preview: %s", default_resume_src)
+    else:
+        console.print(
+            "[dim]Sample profile omitted: scoring uses uploaded keyword résumés only (not ~/.applypilot/resume.txt). "
+            "Each job uses its own file + discovery keyword.[/dim]"
+        )
+        if eff_verbose:
+            log.info("Per-job scoring uses role_resumes/ uploads; profile.json is not merged for those rows.")
+    if not criteria.fallback_to_profile_resume:
+        console.print(
+            "[dim]Scoring uses only uploaded keyword résumés (Find jobs → role_resumes/); "
+            "jobs without a matching file for their discovery keyword are skipped.[/dim]"
+        )
 
     conn = get_connection()
 
@@ -1101,29 +1269,43 @@ def run_scoring(
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
 
-    # Safety pass: remove any existing jobs that require >25% travel.
-    travel_filtered = 0
-    kept_jobs: list[dict] = []
-    for job in jobs:
-        desc = job.get("full_description") or ""
-        too_much_travel, travel_pct = is_excessive_travel_requirement(desc)
-        if too_much_travel:
-            conn.execute("DELETE FROM jobs WHERE url = ?", (job.get("url"),))
-            travel_filtered += 1
-            if eff_verbose:
-                log.info(
-                    "Travel filter: removed '%s' (%s%% travel > 25%%)",
-                    (job.get("title") or "?")[:80],
-                    travel_pct,
-                )
-            continue
-        kept_jobs.append(job)
-    if travel_filtered:
-        conn.commit()
-        console.print(
-            f"[yellow]Travel filter: removed {travel_filtered} job(s) requiring >25% travel before scoring.[/yellow]"
-        )
-    jobs = kept_jobs
+    # Optional: remove jobs that require >25% travel (matches scoring criteria toggle).
+    if criteria.filter_travel_over_25:
+        travel_filtered = 0
+        kept_jobs: list[dict] = []
+        for job in jobs:
+            desc = job.get("full_description") or ""
+            too_much_travel, travel_pct = is_excessive_travel_requirement(desc)
+            if too_much_travel:
+                conn.execute("DELETE FROM jobs WHERE url = ?", (job.get("url"),))
+                travel_filtered += 1
+                if eff_verbose:
+                    log.info(
+                        "Travel filter: removed '%s' (%s%% travel > 25%%)",
+                        (job.get("title") or "?")[:80],
+                        travel_pct,
+                    )
+                continue
+            kept_jobs.append(job)
+        if travel_filtered:
+            conn.commit()
+            console.print(
+                f"[yellow]Travel filter: removed {travel_filtered} job(s) requiring >25% travel before scoring.[/yellow]"
+            )
+        jobs = kept_jobs
+
+    if not criteria.fallback_to_profile_resume:
+        n_before = len(jobs)
+        jobs = [
+            j
+            for j in jobs
+            if resolve_resume_text_for_job(j, fallback_to_profile=False)[0].strip()
+        ]
+        skipped_upload = n_before - len(jobs)
+        if skipped_upload:
+            console.print(
+                f"[yellow]Skipping {skipped_upload} job(s) with no uploaded résumé for the discovery keyword.[/yellow]"
+            )
 
     cs = max(1, int(chunk_size))
     cd = max(0.0, float(chunk_delay))
@@ -1162,7 +1344,20 @@ def run_scoring(
         chunk_fail = 0
 
         for j_idx, job in enumerate(chunk):
-            result = score_job(candidate_profile, job, verbose=eff_verbose)
+            resume_text, resume_src, from_role_upload = resolve_resume_text_for_job(
+                job,
+                fallback_to_profile=criteria.fallback_to_profile_resume,
+            )
+            candidate_profile, _, _ = build_condensed_candidate_profile(
+                resume_text,
+                profile,
+                search_query=job.get("search_query"),
+                from_role_upload=from_role_upload,
+                criteria=criteria,
+            )
+            if eff_verbose:
+                log.debug("Scoring %s — résumé source: %s", (job.get("url") or "")[:64], resume_src)
+            result = score_job(candidate_profile, job, criteria=criteria, verbose=eff_verbose)
             result["url"] = job["url"]
             completed += 1
 
@@ -1179,7 +1374,7 @@ def run_scoring(
                 "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
                 (
                     result["score"],
-                    f"{result['keywords']}\n{result['reasoning']}",
+                    _format_score_reasoning_for_db(result),
                     now,
                     result["url"],
                 ),
@@ -1321,37 +1516,54 @@ def run_score_one(
     job = find_job_for_score_one(
         conn, url_fragment=url_fragment, title_substring=title
     )
-    too_much_travel, travel_pct = is_excessive_travel_requirement(job.get("full_description") or "")
-    if too_much_travel:
-        raise ValueError(
-            f"Job filtered: requires {travel_pct}% travel (max allowed is 25%)."
-        )
-    resume_text, resume_source_used = ensure_clean_resume_text()
-    profile = _load_profile_for_scoring()
-    if not profile:
-        console.print()
-        console.print(
-            Panel(
-                _example_defaults_block(),
-                title="Profile status",
-                border_style="yellow",
-                expand=False,
+    criteria = load_scoring_criteria()
+    if criteria.filter_travel_over_25:
+        too_much_travel, travel_pct = is_excessive_travel_requirement(job.get("full_description") or "")
+        if too_much_travel:
+            raise ValueError(
+                f"Job filtered: requires {travel_pct}% travel (max allowed is 25%)."
             )
+    resume_text, resume_source_used, from_role_upload = resolve_resume_text_for_job(
+        job,
+        fallback_to_profile=criteria.fallback_to_profile_resume,
+    )
+    if not (resume_text or "").strip():
+        raise ValueError(
+            "No résumé text for this job: upload a file for this search keyword on Find jobs, "
+            "or enable fallback to the profile résumé in scoring criteria (scoring_criteria.json)."
         )
-    elif profile_has_placeholders(profile):
-        print_profile_placeholder_warning()
-    candidate_profile, _, _ = build_condensed_candidate_profile(resume_text, profile)
+    profile = _load_profile_for_scoring()
+    if not from_role_upload:
+        if not profile:
+            console.print()
+            console.print(
+                Panel(
+                    _example_defaults_block(),
+                    title="Profile status",
+                    border_style="yellow",
+                    expand=False,
+                )
+            )
+        elif profile_has_placeholders(profile):
+            print_profile_placeholder_warning()
+    candidate_profile, _, _ = build_condensed_candidate_profile(
+        resume_text,
+        profile,
+        search_query=job.get("search_query"),
+        from_role_upload=from_role_upload,
+        criteria=criteria,
+    )
     print_scoring_candidate_profile(candidate_profile)
     if verbose:
         log.info("Resume source used for score-one: %s", resume_source_used)
-    result = score_job(candidate_profile, job, verbose=verbose)
+    result = score_job(candidate_profile, job, criteria=criteria, verbose=verbose)
     if write_db:
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
             (
                 result["score"],
-                f"{result.get('keywords', '')}\n{result.get('reasoning', '')}",
+                _format_score_reasoning_for_db(result),
                 now,
                 job["url"],
             ),

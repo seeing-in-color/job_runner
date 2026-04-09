@@ -66,14 +66,14 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     so it won't destroy existing data.
 
     Schema columns by stage:
-      - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
+      - Discovery:  url, title, salary, description, location, site, strategy, discovered_at, search_query
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
       - Scoring:    fit_score, score_reasoning, scored_at
       - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
                    agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
-                   verification_confidence
+                   verification_confidence, application_track
 
     Args:
         db_path: Override the default DB_PATH.
@@ -98,6 +98,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             site                  TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
+            search_query          TEXT,
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
@@ -129,13 +130,16 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
-            verification_confidence TEXT
+            verification_confidence TEXT,
+
+            application_track     TEXT
         )
     """)
     conn.commit()
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    migrate_legacy_application_tracks(conn)
 
     return conn
 
@@ -153,6 +157,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
+    "search_query": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -180,6 +185,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    "application_track": "TEXT",
 }
 
 
@@ -349,10 +355,10 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, search_query) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), site, strategy, now, job.get("search_query")),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -450,5 +456,101 @@ def delete_jobs_below_score(
         "DELETE FROM jobs WHERE fit_score IS NOT NULL AND fit_score < ?",
         (th,),
     )
+    conn.commit()
+    return int(count)
+
+
+# Values for jobs.application_track (UI / filtering). Legacy apply/track/hold are migrated on init.
+APPLICATION_TRACK_VALUES: frozenset[str] = frozenset({"open", "applied", "follow_up", "interview", ""})
+
+
+def migrate_legacy_application_tracks(conn: sqlite3.Connection | None = None) -> None:
+    """Map legacy apply / track / hold to applied / follow_up / open."""
+    if conn is None:
+        conn = get_connection()
+    legacy_map = (("apply", "applied"), ("track", "follow_up"), ("hold", "open"))
+    for old, new in legacy_map:
+        conn.execute(
+            "UPDATE jobs SET application_track = ? WHERE lower(trim(coalesce(application_track,''))) = ?",
+            (new, old),
+        )
+    conn.commit()
+
+
+def list_jobs_for_apply_track(
+    track: str,
+    *,
+    conn: sqlite3.Connection | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Return jobs with ``application_track`` equal to ``track`` (empty string = unset/null)."""
+    if conn is None:
+        conn = get_connection()
+    tr = (track or "").strip().lower()
+    if tr not in APPLICATION_TRACK_VALUES:
+        raise ValueError(f"Invalid track {track!r}; use one of {sorted(APPLICATION_TRACK_VALUES - {''})} or ''.")
+    lim = max(1, min(5000, int(limit)))
+
+    if tr == "":
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE application_track IS NULL OR trim(application_track) = '' "
+            "ORDER BY discovered_at DESC LIMIT ?",
+            (lim,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE lower(trim(application_track)) = ? "
+            "ORDER BY discovered_at DESC LIMIT ?",
+            (tr, lim),
+        ).fetchall()
+
+    if not rows:
+        return []
+    columns = rows[0].keys()
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def set_application_track(
+    url: str,
+    track: str | None,
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Set ``application_track`` for one job. Pass ``None`` or ``''`` to clear."""
+    if conn is None:
+        conn = get_connection()
+    if not url or not str(url).strip():
+        return False
+    raw = (track or "").strip().lower()
+    if raw and raw not in APPLICATION_TRACK_VALUES:
+        raise ValueError(f"Invalid track {track!r}; use one of {sorted(APPLICATION_TRACK_VALUES - {''})}.")
+    val: str | None = raw if raw else None
+    cur = conn.execute(
+        "UPDATE jobs SET application_track = ? WHERE url = ?",
+        (val, str(url).strip()),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def clear_fit_scores(conn: sqlite3.Connection | None = None) -> int:
+    """Clear LLM scores so jobs can be scored again (keeps rows). Returns rows updated."""
+    if conn is None:
+        conn = get_connection()
+    count = conn.execute("SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL").fetchone()[0]
+    conn.execute(
+        "UPDATE jobs SET fit_score = NULL, score_reasoning = NULL, scored_at = NULL "
+        "WHERE fit_score IS NOT NULL"
+    )
+    conn.commit()
+    return int(count)
+
+
+def delete_scored_jobs(conn: sqlite3.Connection | None = None) -> int:
+    """Delete rows that already have a ``fit_score`` (destructive prune)."""
+    if conn is None:
+        conn = get_connection()
+    count = conn.execute("SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL").fetchone()[0]
+    conn.execute("DELETE FROM jobs WHERE fit_score IS NOT NULL")
     conn.commit()
     return int(count)

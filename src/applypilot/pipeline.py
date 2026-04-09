@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from applypilot.config import load_env, ensure_dirs
+from applypilot.config import load_env, ensure_dirs, load_search_config
 from applypilot.database import init_db, get_connection, get_stats
 
 log = logging.getLogger(__name__)
@@ -63,38 +63,57 @@ def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
     stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
 
-    # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
-    try:
-        from applypilot.discovery.jobspy import run_discovery
-        run_discovery()
-        stats["jobspy"] = "ok"
-    except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
-        console.print(f"  [red]JobSpy error:[/red] {e}")
-        stats["jobspy"] = f"error: {e}"
+    load_env()
+    search_cfg = load_search_config()
+    disc = (search_cfg or {}).get("discovery") or {}
+    run_jobspy = bool(disc.get("run_jobspy", True))
+    run_workday = bool(disc.get("run_workday", True))
+    run_smart_extract = bool(disc.get("run_smart_extract", True))
+
+    # JobSpy (Indeed, LinkedIn, etc.)
+    if run_jobspy:
+        console.print("  [cyan]JobSpy full crawl...[/cyan]")
+        try:
+            from applypilot.discovery.jobspy import run_discovery
+            run_discovery()
+            stats["jobspy"] = "ok"
+        except Exception as e:
+            log.error("JobSpy crawl failed: %s", e)
+            console.print(f"  [red]JobSpy error:[/red] {e}")
+            stats["jobspy"] = f"error: {e}"
+    else:
+        console.print("  [dim]JobSpy skipped (searches.yaml discovery.run_jobspy: false).[/dim]")
+        stats["jobspy"] = "skipped"
 
     # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
-    try:
-        from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
-    except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
+    if run_workday:
+        console.print("  [cyan]Workday corporate scraper...[/cyan]")
+        try:
+            from applypilot.discovery.workday import run_workday_discovery
+            run_workday_discovery(workers=workers)
+            stats["workday"] = "ok"
+        except Exception as e:
+            log.error("Workday scraper failed: %s", e)
+            console.print(f"  [red]Workday error:[/red] {e}")
+            stats["workday"] = f"error: {e}"
+    else:
+        console.print("  [dim]Workday discovery skipped (searches.yaml discovery.run_workday: false).[/dim]")
+        stats["workday"] = "skipped"
 
     # Smart extract
-    console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
-    try:
-        from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract(workers=workers)
-        stats["smartextract"] = "ok"
-    except Exception as e:
-        log.error("Smart extract failed: %s", e)
-        console.print(f"  [red]Smart extract error:[/red] {e}")
-        stats["smartextract"] = f"error: {e}"
+    if run_smart_extract:
+        console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
+        try:
+            from applypilot.discovery.smartextract import run_smart_extract
+            run_smart_extract(workers=workers)
+            stats["smartextract"] = "ok"
+        except Exception as e:
+            log.error("Smart extract failed: %s", e)
+            console.print(f"  [red]Smart extract error:[/red] {e}")
+            stats["smartextract"] = f"error: {e}"
+    else:
+        console.print("  [dim]Smart extract skipped (searches.yaml discovery.run_smart_extract: false).[/dim]")
+        stats["smartextract"] = "skipped"
 
     return stats
 
@@ -114,6 +133,7 @@ def _run_score(
     chunk_size: int = 25,
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
+    rescore: bool = False,
 ) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10 (chunked for API stability)."""
     try:
@@ -122,6 +142,7 @@ def _run_score(
             chunk_size=chunk_size,
             chunk_delay=chunk_delay,
             verbose=score_verbose,
+            rescore=rescore,
         )
         return {"status": "ok"}
     except Exception as e:
@@ -273,6 +294,7 @@ def _run_stage_streaming(
     chunk_size: int = 25,
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
+    rescore: bool = False,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -291,6 +313,7 @@ def _run_stage_streaming(
         kwargs["chunk_size"] = chunk_size
         kwargs["chunk_delay"] = chunk_delay
         kwargs["score_verbose"] = score_verbose
+        kwargs["rescore"] = rescore
 
     upstream = _UPSTREAM[stage]
 
@@ -346,6 +369,7 @@ def _run_sequential(
     chunk_size: int = 25,
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
+    rescore: bool = False,
 ) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
@@ -373,6 +397,7 @@ def _run_sequential(
                 kwargs["chunk_size"] = chunk_size
                 kwargs["chunk_delay"] = chunk_delay
                 kwargs["score_verbose"] = score_verbose
+                kwargs["rescore"] = rescore
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -411,6 +436,7 @@ def _run_streaming(
     chunk_size: int = 25,
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
+    rescore: bool = False,
 ) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
@@ -443,6 +469,7 @@ def _run_streaming(
                 chunk_size,
                 chunk_delay,
                 score_verbose,
+                rescore,
             ),
             name=f"stage-{name}",
             daemon=True,
@@ -494,6 +521,7 @@ def run_pipeline(
     chunk_size: int = 25,
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
+    rescore: bool = False,
 ) -> dict:
     """Run pipeline stages.
 
@@ -506,6 +534,7 @@ def run_pipeline(
         chunk_size: Jobs per batch for the score stage (default 25).
         chunk_delay: Seconds to pause between score chunks (default 5).
         score_verbose: Full diagnostic logs for the score stage (prompt sizes, job essentials, chunk summaries).
+        rescore: Score stage only: re-score all jobs with descriptions (not just unscored rows).
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -532,7 +561,8 @@ def run_pipeline(
     console.print(f"  Validation: {validation_mode}")
     if "score" in ordered:
         console.print(
-            f"  Score:      chunk_size={chunk_size}, chunk_delay={chunk_delay}s, verbose={score_verbose}"
+            f"  Score:      chunk_size={chunk_size}, chunk_delay={chunk_delay}s, verbose={score_verbose}, "
+            f"rescore={rescore}"
         )
     console.print(f"  Stages:     {' -> '.join(ordered)}")
 
@@ -558,6 +588,7 @@ def run_pipeline(
             chunk_size=chunk_size,
             chunk_delay=chunk_delay,
             score_verbose=score_verbose,
+            rescore=rescore,
         )
     else:
         result = _run_sequential(
@@ -568,6 +599,7 @@ def run_pipeline(
             chunk_size=chunk_size,
             chunk_delay=chunk_delay,
             score_verbose=score_verbose,
+            rescore=rescore,
         )
 
     # Summary table

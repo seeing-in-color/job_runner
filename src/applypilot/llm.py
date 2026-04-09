@@ -17,6 +17,8 @@ import time
 
 import httpx
 
+from applypilot.cost_tracking import record_llm_usage
+
 log = logging.getLogger(__name__)
 
 # Gemini REST base (generateContent: .../models/{model}:generateContent)
@@ -193,6 +195,21 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
         try:
+            um = data.get("usageMetadata") or {}
+            pt = int(um.get("promptTokenCount") or 0)
+            ct = int(um.get("candidatesTokenCount") or 0)
+            if not ct and um.get("totalTokenCount"):
+                ct = max(0, int(um["totalTokenCount"]) - pt)
+            if pt or ct:
+                try:
+                    record_llm_usage(
+                        provider="gemini",
+                        model=self.model,
+                        input_tokens=pt,
+                        output_tokens=max(0, ct),
+                    )
+                except Exception:
+                    pass
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError) as e:
             raise RuntimeError(
@@ -237,7 +254,7 @@ class LLMClient:
             headers=headers,
         )
 
-        return self._handle_compat_response(resp)
+        return self._parse_compat_response(resp)
 
     # -- Anthropic Messages API ---------------------------------------------
 
@@ -282,16 +299,41 @@ class LLMClient:
         if resp.status_code >= 400:
             resp.raise_for_status()
         data = resp.json()
+        usage = data.get("usage") or {}
+        it = usage.get("input_tokens")
+        ot = usage.get("output_tokens")
+        if it is not None and ot is not None:
+            try:
+                record_llm_usage(
+                    provider="anthropic",
+                    model=self.model,
+                    input_tokens=int(it),
+                    output_tokens=int(ot),
+                )
+            except Exception:
+                pass
         blocks = data.get("content") or []
         texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
         return "\n".join(t for t in texts if t).strip()
 
-    @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
+    def _parse_compat_response(self, resp: httpx.Response) -> str:
         if resp.status_code >= 400:
             _log_openai_error_body(resp)
             resp.raise_for_status()
         data = resp.json()
+        usage = data.get("usage") or {}
+        pt = usage.get("prompt_tokens")
+        ct = usage.get("completion_tokens")
+        if pt is not None and ct is not None:
+            try:
+                record_llm_usage(
+                    provider="openai_compat",
+                    model=self.model,
+                    input_tokens=int(pt),
+                    output_tokens=int(ct),
+                )
+            except Exception:
+                pass
         msg = data.get("choices", [{}])[0].get("message") or {}
         content = msg.get("content")
         if content is None:

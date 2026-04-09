@@ -22,6 +22,7 @@ from rich.console import Console
 
 from applypilot.config import APP_DIR, DB_PATH
 from applypilot.database import get_connection
+from applypilot.scoring.scorer import parse_stored_score_reasoning
 
 console = Console()
 
@@ -166,11 +167,12 @@ def generate_dashboard(output_path: str | None = None) -> str:
         if reason_raw.strip():
             reason_seq += 1
             reason_id = f"reason-{reason_seq}"
-            reason_lines = [ln.strip() for ln in str(reason_raw).split("\n") if ln.strip()]
+            parsed = parse_stored_score_reasoning(str(reason_raw))
             reasoning_map[reason_id] = {
-                "raw": str(reason_raw),
-                "keywords": reason_lines[0] if reason_lines else "",
-                "reasoning": reason_lines[1] if len(reason_lines) > 1 else (reason_lines[0] if reason_lines else ""),
+                "raw": parsed["raw"],
+                "keywords": parsed["keywords"],
+                "reasoning": parsed["reasoning"],
+                "criteria_table": parsed["criteria_table"],
             }
             why_cell = (
                 f'<button class="why-btn" type="button" '
@@ -513,6 +515,17 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .modal-close {{ background: #334155; border: 1px solid #475569; color: #cbd5e1; border-radius: 6px; padding: 0.25rem 0.55rem; cursor: pointer; }}
   .modal-body {{ padding: 1rem; color: #e2e8f0; line-height: 1.55; white-space: normal; overflow: auto; max-height: calc(80vh - 58px); }}
   .reason-section {{ margin-bottom: 0.45rem; }}
+  .reason-criteria {{
+    margin: 0.35rem 0 0;
+    padding: 0.5rem 0.65rem;
+    background: #0f172a;
+    border-radius: 6px;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border: 1px solid rgba(255,255,255,0.08);
+  }}
   .reason-title {{ font-size: 0.78rem; color: #94a3b8; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.18rem; }}
   .reason-text {{ font-size: 0.9rem; color: #e2e8f0; line-height: 1.6; white-space: pre-wrap; }}
   .reason-list {{ margin: 0.12rem 0 0 1rem; padding: 0; }}
@@ -702,7 +715,8 @@ function openReasoningModal(reasonId) {{
     .replaceAll('\"', '&quot;')
     .replaceAll(\"'\", '&#39;');
 
-  const reasoning = String(payload.reasoning || payload.raw || '').trim();
+  const reasoning = String(payload.reasoning || '').trim();
+  const criteriaTable = String(payload.criteria_table || '').trim();
   const keywords = String(payload.keywords || '').trim();
   const sentences = reasoning
     .split(/(?<=[.!?])\\s+/)
@@ -740,6 +754,7 @@ function openReasoningModal(reasonId) {{
     : '<div class="reason-empty">None explicitly identified in the current rationale.</div>';
 
   body.innerHTML = `
+    ${{criteriaTable ? `<div class="reason-section"><div class="reason-title">Criteria breakdown</div><pre class="reason-criteria">${{esc(criteriaTable)}}</pre></div>` : ''}}
     <div class="reason-section">
       <div class="reason-title">Overall</div>
       <div class="reason-text">${{esc(reasoning || 'No reasoning text available.')}}</div>

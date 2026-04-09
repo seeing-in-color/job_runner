@@ -98,6 +98,12 @@ boards:
   - zip_recruiter
   - google
 
+# Optional: turn off parts of `applypilot run discover` (default: all true)
+discovery:
+  run_jobspy: true
+  run_workday: true
+  run_smart_extract: true
+
 # Search defaults
 defaults:
   results_per_site: 100  # Max results per board per query

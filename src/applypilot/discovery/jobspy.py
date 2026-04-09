@@ -8,11 +8,12 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import site
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
-
-from jobspy import scrape_jobs
+from pathlib import Path
 
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
@@ -25,8 +26,72 @@ from applypilot.discovery.travel_filter import is_excessive_travel_requirement
 
 log = logging.getLogger(__name__)
 
+_scrape_jobs_fn = None
 
 _KNOWN_GLASSDOOR_API_ERROR = "glassdoor: error encountered in api response"
+
+
+def _iter_site_packages() -> list[Path]:
+    roots: list[Path] = []
+    for prefix in {sys.prefix, getattr(sys, "base_prefix", sys.prefix)}:
+        v = f"{sys.version_info.major}.{sys.version_info.minor}"
+        roots.append(Path(prefix) / "lib" / f"python{v}" / "site-packages")
+    try:
+        roots.extend(Path(p) for p in site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        u = site.getusersitepackages()
+        if isinstance(u, str) and u:
+            roots.append(Path(u))
+    except Exception:
+        pass
+    return [p for p in roots if p.is_dir()]
+
+
+def _ensure_python_jobspy() -> None:
+    """Raise if a broken ``jobspy`` tree is on disk (wrong PyPI package).
+
+    The real scraper is published as **python-jobspy** on PyPI (imports as ``jobspy``).
+    A partial or name-collision install can leave ``jobspy/__init__.py`` importing
+    ``jobspy.bayt`` without shipping ``bayt.py``.
+    """
+    for root in _iter_site_packages():
+        jd = root / "jobspy"
+        if not jd.is_dir() or not (jd / "__init__.py").is_file():
+            continue
+        has_bayt = (jd / "bayt.py").is_file() or (jd / "bayt").is_dir()
+        if not has_bayt:
+            raise RuntimeError(
+                "JobSpy install is incomplete: `jobspy.bayt` is missing under site-packages/jobspy/. "
+                "Common causes: (1) the wrong PyPI package named `jobspy` was installed instead of "
+                "`python-jobspy`; (2) a partial/corrupt install; (3) an old venv never had dependencies synced.\n\n"
+                "Fix (use one):\n"
+                "  uv sync\n"
+                "  # or: pip install --force-reinstall 'python-jobspy>=1.1.0'\n"
+                "  # if a wrong package is present: pip uninstall jobspy && pip install python-jobspy\n\n"
+                "Then re-run discover."
+            )
+        return
+
+
+def _get_scrape_jobs():
+    """Lazy-import ``scrape_jobs`` after validating the install."""
+    global _scrape_jobs_fn
+    if _scrape_jobs_fn is not None:
+        return _scrape_jobs_fn
+    _ensure_python_jobspy()
+    try:
+        from jobspy import scrape_jobs
+    except ImportError as e:
+        err = str(e).lower()
+        if "jobspy" in err:
+            raise ImportError(
+                "python-jobspy is not installed or broken. Install with: pip install python-jobspy"
+            ) from e
+        raise
+    _scrape_jobs_fn = scrape_jobs
+    return _scrape_jobs_fn
 
 
 class _SuppressKnownJobSpyGlassdoorNoise(logging.Filter):
@@ -112,6 +177,7 @@ def parse_proxy(proxy_str: str) -> dict:
 
 def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0):
     """Call scrape_jobs with retry on transient failures."""
+    scrape_jobs = _get_scrape_jobs()
     for attempt in range(max_retries + 1):
         try:
             return scrape_jobs(**kwargs)
@@ -202,8 +268,16 @@ def _filter_jobspy_dataframe(df, accept_locs: list[str], reject_locs: list[str],
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
-def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
-    """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
+def store_jobspy_results(
+    conn: sqlite3.Connection,
+    df,
+    *,
+    search_query: str | None = None,
+) -> tuple[int, int]:
+    """Store JobSpy DataFrame results into the DB. Returns (new, existing).
+
+    ``search_query`` is the discovery keyword for this crawl (per-job relevance / role résumé).
+    """
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
@@ -233,7 +307,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
                 salary += f"/{interval}"
 
         description = str(row.get("description", "")) if str(row.get("description", "")) != "nan" else None
-        site_name = str(row.get("site", source_label))
+        site_name = str(row.get("site", "")) if str(row.get("site", "")) != "nan" else ""
+        if not site_name:
+            site_name = "jobspy"
         is_remote = row.get("is_remote", False)
 
         site_label = f"{site_name}"
@@ -269,10 +345,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "search_query, full_description, application_url, detail_scraped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                 search_query, full_description, apply_url, detail_scraped_at),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -398,7 +474,7 @@ def _run_one_search(
     filtered = before - len(df)
 
     conn = get_connection()
-    new, existing = store_jobspy_results(conn, df, s["query"])
+    new, existing = store_jobspy_results(conn, df, search_query=s["query"])
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
@@ -449,7 +525,7 @@ def search_jobs(
         kwargs["linkedin_fetch_description"] = True
 
     try:
-        df = scrape_jobs(**kwargs)
+        df = _get_scrape_jobs()(**kwargs)
     except Exception as e:
         log.error("JobSpy search failed: %s", e)
         return {"error": str(e), "total": 0, "new": 0, "existing": 0}
@@ -471,7 +547,7 @@ def search_jobs(
     df = _filter_jobspy_dataframe(df, accept_locs, reject_locs, legacy_location)
 
     conn = init_db()
-    new, existing = store_jobspy_results(conn, df, query)
+    new, existing = store_jobspy_results(conn, df, search_query=query)
     log.info("Stored: %d new, %d already in DB", new, existing)
 
     db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
@@ -589,6 +665,8 @@ def run_discovery(cfg: dict | None = None) -> dict:
     """
     if cfg is None:
         cfg = config.load_search_config()
+
+    _ensure_python_jobspy()
 
     if not cfg:
         log.warning("No search configuration found. Run `applypilot init` to create one.")

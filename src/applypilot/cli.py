@@ -183,6 +183,11 @@ def run(
         "--score-verbose",
         help="Score stage: full logs (prompt sizes, job essentials, chunk summaries). Default: minimal.",
     ),
+    rescore: bool = typer.Option(
+        False,
+        "--rescore",
+        help="Score stage: re-score every job that has a full description (ignores existing fit_score).",
+    ),
     url_fragment: Optional[str] = typer.Option(
         None,
         "--url-fragment",
@@ -229,6 +234,12 @@ def run(
         )
         raise typer.Exit(code=1)
 
+    if rescore and "all" not in stage_list and "score" not in stage_list:
+        console.print(
+            "[yellow]Note:[/yellow] --rescore only applies when the [bold]score[/bold] stage runs "
+            "(e.g. [bold]applypilot run score --rescore[/bold] or include [bold]score[/bold] in the stage list)."
+        )
+
     # Validate stage names
     for s in stage_list:
         if s != "all" and s not in VALID_STAGES:
@@ -263,6 +274,7 @@ def run(
         chunk_size=chunk_size,
         chunk_delay=chunk_delay,
         score_verbose=score_verbose,
+        rescore=rescore,
     )
 
     if result.get("errors"):
@@ -658,13 +670,23 @@ def doctor() -> None:
     else:
         results.append(("searches.yaml", warn_mark, "Will use example config — run 'applypilot init'"))
 
-    # jobspy (discovery dep installed separately)
+    # jobspy (discovery dep: PyPI package ``python-jobspy``, not ``jobspy``)
     try:
-        import jobspy  # noqa: F401
+        from applypilot.discovery.jobspy import _ensure_python_jobspy, _get_scrape_jobs
+
+        _ensure_python_jobspy()
+        _get_scrape_jobs()
         results.append(("python-jobspy", ok_mark, "Job board scraping available"))
     except ImportError:
-        results.append(("python-jobspy", warn_mark,
-                        "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
+        results.append(
+            (
+                "python-jobspy",
+                warn_mark,
+                "Run `uv sync` or `pip install -e .` — core dep; wrong package: `pip uninstall jobspy` then `pip install python-jobspy`",
+            )
+        )
+    except Exception as e:
+        results.append(("python-jobspy", warn_mark, str(e)[:200]))
 
     # --- Tier 2 checks ---
     import os
@@ -739,6 +761,71 @@ def doctor() -> None:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
 
     console.print()
+
+
+@app.command()
+def ui(
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help="Bind address (default: localhost only).",
+    ),
+    port: int = typer.Option(
+        8844,
+        "--port",
+        "-p",
+        help="HTTP port for the local UI.",
+    ),
+    no_browser: bool = typer.Option(
+        False,
+        "--no-browser",
+        help="Do not open a browser tab (e.g. SSH or automated runs).",
+    ),
+) -> None:
+    """Start the local web control panel (install optional ``[webui]`` first)."""
+    try:
+        import uvicorn
+    except ImportError as e:
+        console.print(
+            "[red]Missing web UI dependencies. Run:[/red]\n"
+            "  [bold]uv pip install -e \".[webui]\"[/bold]"
+        )
+        raise typer.Exit(1) from e
+
+    import os
+    import threading
+    import webbrowser
+
+    bind_host = host.strip() or "127.0.0.1"
+    bind_port = max(1, min(65535, int(port)))
+    os.environ["APPLYPILOT_UI_HOST"] = bind_host
+    os.environ["APPLYPILOT_UI_PORT"] = str(bind_port)
+
+    _bootstrap()
+
+    from applypilot.webui.app import create_app
+
+    reload = os.environ.get("APPLYPILOT_UI_RELOAD", "").strip().lower() in ("1", "true", "yes")
+    open_host = "127.0.0.1" if bind_host in ("0.0.0.0", "::") else bind_host
+    url = f"http://{open_host}:{bind_port}/"
+    console.print(f"[bold]ApplyPilot UI[/bold] → {url}")
+
+    env_skip = os.environ.get("APPLYPILOT_UI_NO_BROWSER", "").strip().lower() in ("1", "true", "yes")
+    # Reload uses a supervisor process; skip auto-open to avoid duplicate or wrong-process opens.
+    if not no_browser and not reload and not env_skip:
+
+        def _open_later() -> None:
+            webbrowser.open(url)
+
+        threading.Timer(0.85, _open_later).start()
+
+    uvicorn.run(
+        create_app(),
+        host=bind_host,
+        port=bind_port,
+        log_level="info",
+        reload=reload,
+    )
 
 
 if __name__ == "__main__":

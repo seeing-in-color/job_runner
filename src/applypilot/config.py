@@ -15,6 +15,8 @@ PROJECT_PROFILE_PATH = Path.cwd() / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
+JOB_INTERESTS_PATH = APP_DIR / "job_interests.yaml"
+ROLE_RESUMES_DIR = APP_DIR / "role_resumes"
 ENV_PATH = APP_DIR / ".env"
 
 # Generated output
@@ -88,7 +90,15 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [
+        APP_DIR,
+        TAILORED_DIR,
+        COVER_LETTER_DIR,
+        LOG_DIR,
+        CHROME_WORKER_DIR,
+        APPLY_WORKER_DIR,
+        ROLE_RESUMES_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
 
