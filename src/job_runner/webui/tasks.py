@@ -9,6 +9,8 @@ import sys
 import threading
 import time
 import uuid
+import urllib.parse
+import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,52 @@ def _pipeline_env() -> dict[str, str]:
     prev = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = src if not prev else src + os.pathsep + prev
     return env
+
+
+def _telegram_creds() -> tuple[str | None, str | None]:
+    token = os.environ.get("JOB_RUNNER_TELEGRAM_BOT_TOKEN", "").strip() or None
+    chat_id = os.environ.get("JOB_RUNNER_TELEGRAM_CHAT_ID", "").strip() or None
+    return token, chat_id
+
+
+def _task_kind_for_telegram(cmd: list[str]) -> str | None:
+    parts = [str(x).lower() for x in cmd]
+    if "apply" in parts:
+        return "apply"
+    if "discover-slots" in parts:
+        return "find jobs"
+    if "discover" in parts:
+        return "find jobs"
+    if "score" in parts or "score-one" in parts:
+        return "score"
+    return None
+
+
+def _telegram_notify_finish(kind: str, status: str, rc: int | None) -> None:
+    token, chat_id = _telegram_creds()
+    if not token or not chat_id:
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
+    text = (
+        f"Job Runner: '{kind}' finished.\n"
+        f"Status: {status}\n"
+        f"Return code: {rc if rc is not None else '?'}\n"
+        f"Finished: {ts}"
+    )
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=data,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8):
+            pass
+    except Exception:
+        # Notification must never break job execution.
+        pass
+
+
 _lock = threading.Lock()
 
 
@@ -51,6 +99,7 @@ def start_pipeline_task(cmd: list[str], *, cwd: Path | None = None) -> str:
     """Run ``cmd`` in a background thread; stream combined stdout into ``log``."""
     tid = uuid.uuid4().hex
     root = cwd or repo_root()
+    notify_kind = _task_kind_for_telegram(cmd)
     _store(
         tid,
         status="running",
@@ -98,6 +147,8 @@ def start_pipeline_task(cmd: list[str], *, cwd: Path | None = None) -> str:
                 finished_at=time.time(),
                 returncode=rc,
             )
+            if notify_kind:
+                _telegram_notify_finish("score" if notify_kind == "score" else "find jobs", "done" if rc == 0 else "error", rc)
         except Exception as e:
             with _lock:
                 _running_procs.pop(tid, None)
@@ -111,6 +162,8 @@ def start_pipeline_task(cmd: list[str], *, cwd: Path | None = None) -> str:
                 error=str(e),
                 returncode=-1,
             )
+            if notify_kind:
+                _telegram_notify_finish("score" if notify_kind == "score" else "find jobs", "error", -1)
 
     threading.Thread(target=_worker, daemon=True).start()
     return tid
@@ -346,6 +399,7 @@ def start_discover_slots_task(queries: list[str], *, parallel: int = 2) -> str:
                 finished_at=time.time(),
                 returncode=overall_rc,
             )
+            _telegram_notify_finish("find jobs", "done" if overall_rc == 0 else "error", overall_rc)
         except Exception as e:
             with _lock:
                 _running_procs.pop(tid, None)
@@ -359,6 +413,7 @@ def start_discover_slots_task(queries: list[str], *, parallel: int = 2) -> str:
                 error=str(e),
                 returncode=-1,
             )
+            _telegram_notify_finish("find jobs", "error", -1)
 
     threading.Thread(target=_worker, daemon=True).start()
     return tid
@@ -390,5 +445,32 @@ def build_run_command(body: dict) -> list[str]:
         cmd.extend(["--chunk-delay", str(float(body["chunk_delay"]))])
     if body.get("score_verbose"):
         cmd.append("--score-verbose")
+
+    return cmd
+
+
+def build_apply_command(body: dict) -> list[str]:
+    """Build ``python -m job_runner apply ...`` from UI payload."""
+    cmd: list[str] = [sys.executable, "-m", "job_runner", "apply"]
+    agent = str(body.get("agent", "") or "").strip().lower()
+    model = str(body.get("model", "") or "").strip()
+    workers = int(body.get("workers", 1) or 1)
+    min_score = int(body.get("min_score", 7) or 7)
+    limit = int(body.get("limit", 5) or 5)
+
+    cmd.extend(["--workers", str(max(1, workers))])
+    cmd.extend(["--min-score", str(max(1, min(10, min_score)))])
+    if limit <= 0:
+        cmd.append("--continuous")
+    else:
+        cmd.extend(["--limit", str(limit)])
+    if agent in ("openai", "claude"):
+        cmd.extend(["--agent", agent])
+    if model:
+        cmd.extend(["--model", model])
+    if body.get("headless"):
+        cmd.append("--headless")
+    if body.get("dry_run"):
+        cmd.append("--dry-run")
 
     return cmd

@@ -29,6 +29,9 @@
             </div>
           </div>
           <div class="top-actions__right">
+            <button type="button" class="btn btn-ghost" id="btn-sync-month-cost" title="Sync current month API usage cost">
+              Sync monthly cost
+            </button>
             <button type="button" class="btn btn-ghost" id="btn-logout" hidden title="End browser session (shared password login)">
               Sign out
             </button>
@@ -176,6 +179,30 @@
               </select>
             </div>
             <div class="results-toolbar__actions">
+              <div class="results-apply-box">
+                <label for="apply-agent" title="Agent = the worker that controls browser tools and executes steps.">Agent</label>
+                <select id="apply-agent" class="results-inline-select">
+                  <option value="openai">OpenAI-compatible</option>
+                  <option value="claude">Claude CLI</option>
+                </select>
+                <label for="apply-model" title="Model = the AI brain the agent uses to decide what to click/type next.">Model</label>
+                <select id="apply-model-preset" class="results-inline-select" title="Quick model presets">
+                  <option value="">Custom model…</option>
+                  <option value="deepseek-chat">DeepSeek Chat (cheap)</option>
+                  <option value="deepseek-reasoner">DeepSeek Reasoner (stronger)</option>
+                  <option value="gpt-4.1-mini">GPT-4.1 mini</option>
+                  <option value="claude-3-5-haiku-latest">Claude Haiku</option>
+                  <option value="sonnet">Claude Sonnet</option>
+                </select>
+                <input type="text" id="apply-model" class="results-inline-input" value="deepseek-chat" placeholder="deepseek-chat" />
+                <label for="apply-limit">Jobs</label>
+                <input type="number" id="apply-limit" class="results-inline-num" min="0" max="500" value="5" />
+                <label for="apply-workers">Workers</label>
+                <input type="number" id="apply-workers" class="results-inline-num" min="1" max="8" value="1" />
+                <button type="button" class="btn" id="btn-results-apply" title="Run browser auto-apply on unsubmitted jobs">
+                  Apply
+                </button>
+              </div>
               <button type="button" class="btn btn-ghost" id="btn-results-refresh">Refresh</button>
               <details class="results-actions-menu" id="results-actions-menu">
                 <summary class="btn btn-ghost results-actions-summary">Delete…</summary>
@@ -216,6 +243,7 @@
             <div id="results-sentinel" class="results-sentinel" aria-hidden="true"></div>
           </div>
           <p class="status-bar" id="results-status"></p>
+          <p class="status-bar" id="results-apply-cost"></p>
         </section>
 
         <section id="section-settings" class="section">

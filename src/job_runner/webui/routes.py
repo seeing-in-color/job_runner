@@ -15,7 +15,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from pydantic import BaseModel, Field
 
 from job_runner import __version__
-from job_runner.cost_tracking import get_usage_summary
+from job_runner.cost_tracking import get_usage_summary, sync_current_month
 from job_runner.config import (
     APP_DIR,
     DB_PATH,
@@ -68,6 +68,7 @@ from job_runner.webui.find_jobs_config import (
 from job_runner.webui.auth_middleware import SESSION_KEY, ui_login_password, verify_ui_password
 from job_runner.webui.helpers import client_ip_trusted, repo_root, require_local
 from job_runner.webui.tasks import (
+    build_apply_command,
     build_run_command,
     cancel_pipeline_task,
     get_task,
@@ -237,6 +238,13 @@ def meta() -> dict[str, Any]:
 def get_usage() -> dict[str, Any]:
     """Estimated cumulative LLM spend (from token usage recorded in ``api_usage.json``)."""
     return get_usage_summary()
+
+
+@router.post("/usage/sync-month")
+def post_usage_sync_month(request: Request) -> dict[str, Any]:
+    """User-triggered monthly cost sync snapshot (current month bucket)."""
+    require_local(request)
+    return {"ok": True, "usage": sync_current_month(source="manual_sync_button")}
 
 
 @router.get("/jobs/sites")
@@ -657,10 +665,28 @@ class PipelineBody(BaseModel):
     score_verbose: bool = False
 
 
+class ApplyBody(BaseModel):
+    agent: str = Field("openai", description="openai | claude")
+    model: str | None = Field(None, description="Provider model id (e.g. deepseek-chat, gpt-4.1-mini, sonnet)")
+    limit: int = Field(5, ge=0, le=500)
+    workers: int = Field(1, ge=1, le=8)
+    min_score: int = Field(7, ge=1, le=10)
+    dry_run: bool = False
+    headless: bool = False
+
+
 @router.post("/pipeline/run")
 def post_pipeline_run(request: Request, body: PipelineBody) -> dict[str, Any]:
     require_local(request)
     cmd = build_run_command(body.model_dump())
+    tid = start_pipeline_task(cmd)
+    return {"ok": True, "task_id": tid, "command": cmd}
+
+
+@router.post("/pipeline/apply")
+def post_pipeline_apply(request: Request, body: ApplyBody) -> dict[str, Any]:
+    require_local(request)
+    cmd = build_apply_command(body.model_dump())
     tid = start_pipeline_task(cmd)
     return {"ok": True, "task_id": tid, "command": cmd}
 

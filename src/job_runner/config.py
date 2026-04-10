@@ -261,6 +261,32 @@ def get_apply_openai_model() -> str:
     return os.environ.get("JOB_RUNNER_APPLY_OPENAI_MODEL", "gpt-4.1-mini").strip()
 
 
+def get_apply_openai_api_key() -> str:
+    """API key for OpenAI-compatible apply agent requests.
+
+    Prefers ``JOB_RUNNER_APPLY_OPENAI_API_KEY`` and falls back to ``OPENAI_API_KEY``.
+    """
+    load_env()
+    return (
+        os.environ.get("JOB_RUNNER_APPLY_OPENAI_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+
+
+def get_apply_openai_base_url() -> str | None:
+    """Optional OpenAI-compatible base URL for apply agent requests.
+
+    Order: ``JOB_RUNNER_APPLY_OPENAI_BASE_URL`` then ``OPENAI_BASE_URL``.
+    Returns ``None`` when unset so SDK defaults apply.
+    """
+    load_env()
+    raw = (
+        os.environ.get("JOB_RUNNER_APPLY_OPENAI_BASE_URL", "").strip()
+        or os.environ.get("OPENAI_BASE_URL", "").strip()
+    )
+    return raw or None
+
+
 def get_apply_deterministic_first() -> bool:
     """Run fast deterministic checks (e.g. expired LinkedIn) before calling the LLM."""
     load_env()

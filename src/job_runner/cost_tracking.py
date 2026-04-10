@@ -67,7 +67,34 @@ def _default_state() -> dict[str, Any]:
         "total_estimated_usd": 0.0,
         "llm_calls": 0,
         "by_model": {},
+        "months": {},
+        "last_month_sync_at": None,
+        "last_month_sync_source": "local_usage",
     }
+
+
+def _month_key(ts: float | None = None) -> str:
+    t = time.gmtime(time.time() if ts is None else ts)
+    return f"{t.tm_year:04d}-{t.tm_mon:02d}"
+
+
+def _ensure_month_bucket(st: dict[str, Any], key: str) -> dict[str, Any]:
+    months = st.setdefault("months", {})
+    if key not in months or not isinstance(months.get(key), dict):
+        months[key] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_usd": 0.0,
+            "llm_calls": 0,
+            "by_model": {},
+        }
+    bucket = months[key]
+    bucket.setdefault("input_tokens", 0)
+    bucket.setdefault("output_tokens", 0)
+    bucket.setdefault("estimated_usd", 0.0)
+    bucket.setdefault("llm_calls", 0)
+    bucket.setdefault("by_model", {})
+    return bucket
 
 
 def load_state() -> dict[str, Any]:
@@ -82,6 +109,9 @@ def load_state() -> dict[str, Any]:
             raw[k] = int(raw.get(k, 0))
         raw["total_estimated_usd"] = float(raw.get("total_estimated_usd", 0.0))
         raw.setdefault("by_model", {})
+        raw.setdefault("months", {})
+        raw.setdefault("last_month_sync_at", None)
+        raw.setdefault("last_month_sync_source", "local_usage")
         return raw
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return _default_state()
@@ -109,6 +139,8 @@ def record_llm_usage(
 
     with _lock:
         st = load_state()
+        mk_month = _month_key()
+        month_bucket = _ensure_month_bucket(st, mk_month)
         st["total_input_tokens"] = int(st.get("total_input_tokens", 0)) + inp
         st["total_output_tokens"] = int(st.get("total_output_tokens", 0)) + out
         st["total_estimated_usd"] = float(st.get("total_estimated_usd", 0.0)) + delta_usd
@@ -119,22 +151,56 @@ def record_llm_usage(
         bm[mk]["input_tokens"] = int(bm[mk].get("input_tokens", 0)) + inp
         bm[mk]["output_tokens"] = int(bm[mk].get("output_tokens", 0)) + out
         bm[mk]["estimated_usd"] = float(bm[mk].get("estimated_usd", 0.0)) + delta_usd
+
+        month_bucket["input_tokens"] = int(month_bucket.get("input_tokens", 0)) + inp
+        month_bucket["output_tokens"] = int(month_bucket.get("output_tokens", 0)) + out
+        month_bucket["estimated_usd"] = float(month_bucket.get("estimated_usd", 0.0)) + delta_usd
+        month_bucket["llm_calls"] = int(month_bucket.get("llm_calls", 0)) + 1
+        mbm = month_bucket.setdefault("by_model", {})
+        if mk not in mbm:
+            mbm[mk] = {"input_tokens": 0, "output_tokens": 0, "estimated_usd": 0.0}
+        mbm[mk]["input_tokens"] = int(mbm[mk].get("input_tokens", 0)) + inp
+        mbm[mk]["output_tokens"] = int(mbm[mk].get("output_tokens", 0)) + out
+        mbm[mk]["estimated_usd"] = float(mbm[mk].get("estimated_usd", 0.0)) + delta_usd
         _save_state(st)
 
 
 def get_usage_summary() -> dict[str, Any]:
     with _lock:
         st = load_state()
+    cur_key = _month_key()
+    cur = _ensure_month_bucket(st, cur_key)
     return {
         "total_estimated_usd": round(float(st.get("total_estimated_usd", 0.0)), 4),
         "total_input_tokens": int(st.get("total_input_tokens", 0)),
         "total_output_tokens": int(st.get("total_output_tokens", 0)),
         "llm_calls": int(st.get("llm_calls", 0)),
+        "month_key": cur_key,
+        "current_month_estimated_usd": round(float(cur.get("estimated_usd", 0.0)), 4),
+        "current_month_input_tokens": int(cur.get("input_tokens", 0)),
+        "current_month_output_tokens": int(cur.get("output_tokens", 0)),
+        "current_month_llm_calls": int(cur.get("llm_calls", 0)),
+        "last_month_sync_at": st.get("last_month_sync_at"),
+        "last_month_sync_source": st.get("last_month_sync_source"),
         "updated_at": st.get("updated_at"),
         "by_model": st.get("by_model", {}),
         "path": str(USAGE_PATH),
         "note": "Conservative estimate: token usage × $/1M rates × buffer; actual provider billing may still differ.",
     }
+
+
+def sync_current_month(source: str = "local_usage") -> dict[str, Any]:
+    """Record a user-initiated month sync timestamp/source.
+
+    Current implementation reuses tracked usage; month boundaries auto-roll on UTC month key.
+    """
+    with _lock:
+        st = load_state()
+        _ensure_month_bucket(st, _month_key())
+        st["last_month_sync_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        st["last_month_sync_source"] = source
+        _save_state(st)
+    return get_usage_summary()
 
 
 def reset_usage() -> dict[str, Any]:

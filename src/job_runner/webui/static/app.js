@@ -4,6 +4,9 @@ const $ = (sel, root = document) => root.querySelector(sel);
 
 /** Last pipeline subprocess started from this UI (discover / score); used by Stop. */
 let activePipelineTaskId = null;
+let applyCostBaselineUsd = null;
+let applyCostLastPollMs = 0;
+const APPLY_PREFS_KEY = "jr_apply_prefs_v1";
 
 async function handleApiResponse401(r) {
   if (r.status !== 401) return;
@@ -56,14 +59,20 @@ async function refreshUsage() {
     const u = await r.json();
     const v = $("#cost-value");
     const m = $("#cost-meta");
-    if (v) v.textContent = "$" + Number(u.total_estimated_usd ?? 0).toFixed(2);
+    if (v) v.textContent = "$" + Number(u.current_month_estimated_usd ?? u.total_estimated_usd ?? 0).toFixed(2);
     if (m) {
-      const calls = u.llm_calls ?? 0;
-      const tin = u.total_input_tokens ?? 0;
-      const tout = u.total_output_tokens ?? 0;
-      m.textContent = ` · ${calls} LLM calls · ${(tin + tout).toLocaleString()} tok`;
+      const calls = u.current_month_llm_calls ?? u.llm_calls ?? 0;
+      const tin = u.current_month_input_tokens ?? u.total_input_tokens ?? 0;
+      const tout = u.current_month_output_tokens ?? u.total_output_tokens ?? 0;
+      const mm = u.month_key || "";
+      m.textContent = ` · ${mm} · ${calls} LLM calls · ${(tin + tout).toLocaleString()} tok`;
     }
   } catch (_) {}
+}
+
+async function getUsageSummary() {
+  const r = await api("/usage");
+  return r.json();
 }
 
 async function repairJobSpy() {
@@ -292,6 +301,7 @@ function pollTask(taskId, prefix, options) {
   const okText = opt.okText != null ? opt.okText : "Finished.";
   const errText = opt.errText != null ? opt.errText : "Finished with errors.";
   const cancelText = opt.cancelText != null ? opt.cancelText : "Stopped.";
+  const onTick = typeof opt.onTick === "function" ? opt.onTick : null;
   activePipelineTaskId = taskId;
   const t = setInterval(async () => {
     try {
@@ -299,6 +309,11 @@ function pollTask(taskId, prefix, options) {
       const j = await r.json();
       const tail = (j.log || "") + (j.error ? "\n" + j.error : "");
       terminalSet(pre + tail);
+      if (onTick) {
+        try {
+          await onTick(j);
+        } catch (_) {}
+      }
       if (j.status === "done" || j.status === "error" || j.status === "cancelled") {
         clearInterval(t);
         activePipelineTaskId = null;
@@ -324,6 +339,106 @@ function pollTask(taskId, prefix, options) {
       activePipelineTaskId = null;
     }
   }, 600);
+}
+
+async function updateApplyCostDelta() {
+  const el = $("#results-apply-cost");
+  if (!el || applyCostBaselineUsd == null) return;
+  const now = Date.now();
+  if (now - applyCostLastPollMs < 1500) return;
+  applyCostLastPollMs = now;
+  try {
+    const u = await getUsageSummary();
+    const current = Number(u.total_estimated_usd || 0);
+    const delta = Math.max(0, current - applyCostBaselineUsd);
+    el.textContent = `Apply run cost (est): $${delta.toFixed(4)} · live`;
+  } catch (_) {}
+}
+
+async function runResultsApply() {
+  const status = $("#results-status");
+  const costEl = $("#results-apply-cost");
+  const body = {
+    agent: ($("#apply-agent") && $("#apply-agent").value) || "openai",
+    model: ($("#apply-model") && $("#apply-model").value.trim()) || "",
+    limit: parseInt((($("#apply-limit") && $("#apply-limit").value) || "5"), 10) || 5,
+    workers: parseInt((($("#apply-workers") && $("#apply-workers").value) || "1"), 10) || 1,
+    min_score: 7,
+    dry_run: false,
+    headless: false,
+  };
+  saveApplyPrefs(body);
+  if (status) status.textContent = "Starting apply…";
+  if (costEl) costEl.textContent = "Apply run cost (est): preparing baseline…";
+  try {
+    const u = await getUsageSummary();
+    applyCostBaselineUsd = Number(u.total_estimated_usd || 0);
+    applyCostLastPollMs = 0;
+    const r = await api("/pipeline/apply", { method: "POST", body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiDetailMessage(j) || r.statusText || "Apply run failed");
+    const tid = j.task_id;
+    const cmd = (j.command || []).join(" ");
+    terminalAppend("\n── " + new Date().toLocaleString() + " ──\n");
+    pollTask(tid, "$ " + cmd + "\n\n", {
+      statusEl: "#results-status",
+      okText: "Apply finished.",
+      errText: "Apply finished with errors.",
+      cancelText: "Apply stopped.",
+      onTick: async () => {
+        await updateApplyCostDelta();
+      },
+    });
+  } catch (e) {
+    if (status) status.textContent = String(e.message || e);
+    if (costEl) costEl.textContent = "";
+    terminalAppend(String(e.message || e) + "\n");
+  }
+}
+
+function saveApplyPrefs(body) {
+  try {
+    const prefs = {
+      agent: body.agent || "openai",
+      model: body.model || "",
+      limit: Number(body.limit || 5),
+      workers: Number(body.workers || 1),
+    };
+    localStorage.setItem(APPLY_PREFS_KEY, JSON.stringify(prefs));
+  } catch (_) {}
+}
+
+function loadApplyPrefs() {
+  try {
+    const raw = localStorage.getItem(APPLY_PREFS_KEY);
+    if (!raw) return;
+    const p = JSON.parse(raw);
+    if ($("#apply-agent") && p.agent) $("#apply-agent").value = String(p.agent);
+    if ($("#apply-model") && p.model) $("#apply-model").value = String(p.model);
+    if ($("#apply-limit") && p.limit != null) $("#apply-limit").value = String(p.limit);
+    if ($("#apply-workers") && p.workers != null) $("#apply-workers").value = String(p.workers);
+    syncModelPresetFromText();
+  } catch (_) {}
+}
+
+function syncModelPresetFromText() {
+  const preset = $("#apply-model-preset");
+  const model = $("#apply-model");
+  if (!preset || !model) return;
+  const v = (model.value || "").trim();
+  const has = Array.from(preset.options).some((o) => o.value === v && v);
+  preset.value = has ? v : "";
+}
+
+function wireApplyModelControls() {
+  const preset = $("#apply-model-preset");
+  const model = $("#apply-model");
+  if (!preset || !model) return;
+  preset.addEventListener("change", () => {
+    if (preset.value) model.value = preset.value;
+  });
+  model.addEventListener("input", () => syncModelPresetFromText());
+  syncModelPresetFromText();
 }
 
 async function stopTerminalPipeline() {
@@ -851,6 +966,22 @@ async function postRestart() {
   }
 }
 
+async function syncMonthlyCost() {
+  const costMeta = $("#cost-meta");
+  try {
+    const r = await api("/usage/sync-month", { method: "POST", body: "{}" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiDetailMessage(j) || "Sync failed");
+    await refreshUsage();
+    if (costMeta) {
+      const at = (j.usage && j.usage.last_month_sync_at) || "";
+      if (at) costMeta.textContent += ` · synced ${at.replace("T", " ").replace("Z", " UTC")}`;
+    }
+  } catch (e) {
+    alert(String(e.message || e));
+  }
+}
+
 async function uploadResumeForSlot(fileInput) {
   if (!fileInput || !fileInput.files || !fileInput.files[0]) return;
   const row = parseInt(fileInput.getAttribute("data-slot"), 10);
@@ -932,6 +1063,7 @@ function wireNav() {
     btn.addEventListener("click", () => showSection(btn.getAttribute("data-section")));
   });
   $("#btn-restart") && $("#btn-restart").addEventListener("click", postRestart);
+  $("#btn-sync-month-cost") && $("#btn-sync-month-cost").addEventListener("click", syncMonthlyCost);
   $("#btn-save-find") && $("#btn-save-find").addEventListener("click", saveFindJobs);
   $("#btn-run-discover") && $("#btn-run-discover").addEventListener("click", runDiscover);
   $("#btn-run-discover-slots") &&
@@ -945,6 +1077,7 @@ function wireNav() {
   $("#btn-run-score") && $("#btn-run-score").addEventListener("click", runScore);
   $("#btn-delete-scored") && $("#btn-delete-scored").addEventListener("click", deleteScoredJobs);
   $("#btn-delete-all-jobs") && $("#btn-delete-all-jobs").addEventListener("click", deleteAllJobs);
+  $("#btn-results-apply") && $("#btn-results-apply").addEventListener("click", runResultsApply);
   $("#btn-results-refresh") && $("#btn-results-refresh").addEventListener("click", () => resetAndFetchResults());
   ["filter-q", "filter-site"].forEach((id) => {
     const el = document.getElementById(id);
@@ -1026,6 +1159,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   wireResultsSection();
   wireSettingsResumes();
   wireFindSlotsSection();
+  wireApplyModelControls();
+  loadApplyPrefs();
   loadMeta();
   showSection("dashboard");
   setInterval(refreshUsage, 20000);

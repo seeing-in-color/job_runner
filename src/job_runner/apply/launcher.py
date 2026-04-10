@@ -181,6 +181,7 @@ def mark_result(url: str, status: str, error: str | None = None,
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                           application_track = 'applied',
                            apply_error = NULL, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?

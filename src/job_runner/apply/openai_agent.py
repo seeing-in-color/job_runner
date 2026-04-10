@@ -13,6 +13,7 @@ from job_runner import config
 from job_runner.apply import launcher as launcher_mod
 from job_runner.apply.cdp_driver import CdpPlaywrightDriver
 from job_runner.apply.dashboard import add_event, get_state, update_state
+from job_runner.cost_tracking import record_llm_usage
 from job_runner.apply.deterministic import (
     is_application_form_ready,
     try_apply_field_rules_to_dropdowns,
@@ -575,7 +576,14 @@ def run_job_openai(
             try_apply_field_rules_to_dropdowns(driver, profile)
 
         compact = build_compact_apply_prompt(job, resume_text, dry_run=dry_run)
-        client = OpenAI()
+        api_key = config.get_apply_openai_api_key()
+        base_url = config.get_apply_openai_base_url()
+        if not api_key:
+            raise RuntimeError(
+                "OpenAI-compatible apply agent key missing. Set JOB_RUNNER_APPLY_OPENAI_API_KEY "
+                "or OPENAI_API_KEY in ~/.job_runner/.env."
+            )
+        client = OpenAI(api_key=api_key, base_url=base_url)
         max_turns = config.get_apply_openai_max_turns()
 
         messages: list[dict] = [
@@ -669,6 +677,12 @@ def run_job_openai(
             )
             if resp.usage:
                 _bump_cost(_estimate_cost_usd(model, resp.usage))
+                record_llm_usage(
+                    provider="openai-compatible",
+                    model=model,
+                    input_tokens=int(getattr(resp.usage, "prompt_tokens", 0) or 0),
+                    output_tokens=int(getattr(resp.usage, "completion_tokens", 0) or 0),
+                )
 
             choice = resp.choices[0]
             msg = choice.message
