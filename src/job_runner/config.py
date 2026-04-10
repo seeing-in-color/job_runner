@@ -5,6 +5,40 @@ import platform
 import shutil
 from pathlib import Path
 
+
+def _legacy_dotenv_path() -> Path:
+    """Fixed path used before ``APP_DIR`` is known (bootstrap only)."""
+    return Path.home() / ".job_runner" / ".env"
+
+
+def _bootstrap_job_runner_dir_from_legacy_env_file() -> None:
+    """Apply ``JOB_RUNNER_DIR`` from ``~/.job_runner/.env`` before ``APP_DIR`` is set.
+
+    Lets Windows/Mac users point data at Dropbox with a single line in that file, without OS env
+    dialogs. Skips if ``JOB_RUNNER_DIR`` is already set (e.g. ``export`` in shell).
+    """
+    if (os.environ.get("JOB_RUNNER_DIR") or "").strip():
+        return
+    p = _legacy_dotenv_path()
+    if not p.is_file():
+        return
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("JOB_RUNNER_DIR="):
+            raw = s.split("=", 1)[1].strip().strip('"').strip("'")
+            if raw:
+                os.environ["JOB_RUNNER_DIR"] = raw
+            return
+
+
+_bootstrap_job_runner_dir_from_legacy_env_file()
+
 # User data directory — all user-specific files live here
 APP_DIR = Path(os.environ.get("JOB_RUNNER_DIR", Path.home() / ".job_runner"))
 

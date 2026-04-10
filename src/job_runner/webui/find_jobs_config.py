@@ -224,3 +224,36 @@ def config_with_single_query_from_base(base: dict[str, Any], query: str) -> dict
     else:
         out["queries"] = [{"query": q, "tier": 1}]
     return out
+
+
+def ensure_search_keyword_in_searches(keyword: str) -> bool:
+    """Append ``keyword`` to ``searches.yaml`` ``queries`` if not already present.
+
+    Returns True if the file was written. Used when linking a résumé to a discovery
+    keyword that appears on job rows but was removed from saved searches.
+    """
+    import yaml
+
+    from job_runner.config import SEARCH_CONFIG_PATH, ensure_dirs, load_search_config
+
+    kw = (keyword or "").strip()
+    if not kw:
+        return False
+    ensure_dirs()
+    cfg = load_search_config()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    queries_in = cfg.get("queries") or []
+    queries = [q for q in queries_in if isinstance(q, dict)]
+    existing = {str(q.get("query") or "").strip().lower() for q in queries}
+    if kw.lower() in existing:
+        return False
+    out = deepcopy(cfg)
+    qlist = [q for q in (out.get("queries") or []) if isinstance(q, dict)]
+    qlist.append({"query": kw, "tier": 3})
+    out["queries"] = qlist
+    SEARCH_CONFIG_PATH.write_text(
+        yaml.safe_dump(out, sort_keys=False, allow_unicode=True, default_flow_style=False),
+        encoding="utf-8",
+    )
+    return True

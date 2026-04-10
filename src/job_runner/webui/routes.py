@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import os
+import socket
 import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from typing import Any
 
 import yaml
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from job_runner import __version__
@@ -63,6 +68,7 @@ from job_runner.webui.find_jobs_config import (
     MAX_DISCOVER_PARALLEL,
     apply_find_jobs_form_to_cfg,
     cfg_to_find_jobs_form,
+    ensure_search_keyword_in_searches,
     flatten_slot_queries,
 )
 from job_runner.webui.auth_middleware import SESSION_KEY, ui_login_password, verify_ui_password
@@ -79,6 +85,39 @@ from job_runner.webui.tasks import (
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["api"])
+
+
+def _norm_title_for_import(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+
+def _apply_imported_job_interests(imported: JobInterestsFile) -> dict[str, int]:
+    """Merge keyword ↔ résumé mappings after pack files are on disk."""
+    ensured = 0
+    for imp in imported.interests:
+        t = (imp.title or "").strip()
+        if not t:
+            continue
+        if ensure_search_keyword_in_searches(t):
+            ensured += 1
+    sync_job_interests_to_searches()
+    ji = get_effective_job_interests()
+    linked = 0
+    for imp in imported.interests:
+        t = (imp.title or "").strip()
+        if not t or not (imp.resume_filename or "").strip():
+            continue
+        fn = imp.resume_filename.strip()
+        if not safe_role_resume_path(fn):
+            continue
+        for e in ji.interests:
+            if e.id == imp.id or _norm_title_for_import(e.title) == _norm_title_for_import(t):
+                e.resume_filename = fn
+                linked += 1
+                break
+    save_job_interests(ji)
+    sync_job_interests_to_searches()
+    return {"keywords_ensured": ensured, "resumes_linked": linked}
 
 
 class UiLoginBody(BaseModel):
@@ -227,10 +266,18 @@ def health() -> dict[str, Any]:
 @router.get("/meta")
 def meta() -> dict[str, Any]:
     load_env()
+    trust_lan = os.environ.get("JOB_RUNNER_TRUST_LAN", "").strip().lower() in ("1", "true", "yes")
+    try:
+        hostname = socket.gethostname()
+    except OSError:
+        hostname = ""
     return {
         "version": __version__,
         "tier": get_tier(),
         "app_dir": str(APP_DIR),
+        "hostname": hostname,
+        "role_resumes_dir": str(ROLE_RESUMES_DIR.resolve()),
+        "trust_lan": trust_lan,
     }
 
 
@@ -527,9 +574,19 @@ async def post_interest_upload(
             target = i
             break
     if target is None:
+        # Allow linking uploads to keywords that only appear on stored job rows (e.g. after a device sync).
+        if ensure_search_keyword_in_searches(keyword.strip()):
+            sync_job_interests_to_searches()
+            ji = get_effective_job_interests()
+            kid = keyword_interest_id(keyword)
+            for i in ji.interests:
+                if i.id == kid or i.title.strip().lower() == keyword.strip().lower():
+                    target = i
+                    break
+    if target is None:
         raise HTTPException(
             400,
-            "Keyword not in Find jobs / searches.yaml — add the query there first, save, then upload.",
+            "Could not register keyword for this résumé — check searches.yaml or try again after Save on Find jobs.",
         )
 
     safe = re.sub(r"[^a-zA-Z0-9._-]", "_", file.filename)
@@ -585,6 +642,40 @@ async def post_interest_upload_all(request: Request, file: UploadFile = File(...
     return {"ok": True, "filename": safe, "count": len(ji.interests)}
 
 
+class LinkResumeBody(BaseModel):
+    search_query: str = Field(..., min_length=1, max_length=800)
+    resume_filename: str = Field(..., min_length=1, max_length=260)
+
+
+@router.post("/interests/link")
+def post_interest_link_resume(request: Request, body: LinkResumeBody) -> dict[str, Any]:
+    """Attach an existing file under ``role_resumes/`` to a discovery keyword (``search_query``)."""
+    require_local(request)
+    sq = body.search_query.strip()
+    if not sq:
+        raise HTTPException(400, "search_query is empty")
+    fn = body.resume_filename.strip()
+    if not fn or not safe_role_resume_path(fn):
+        raise HTTPException(400, "Invalid or missing résumé file (must exist under role_resumes/)")
+    ensure_search_keyword_in_searches(sq)
+    sync_job_interests_to_searches()
+    ji = get_effective_job_interests()
+    kid = keyword_interest_id(sq)
+    target = None
+    for i in ji.interests:
+        if i.id == kid or i.title.strip().lower() == sq.lower():
+            target = i
+            break
+    if target is None:
+        raise HTTPException(
+            500,
+            "Keyword could not be merged into job interests after updating searches — try Save on Find jobs.",
+        )
+    target.resume_filename = fn
+    save_job_interests(ji)
+    return {"ok": True, "filename": fn, "interest_id": target.id}
+
+
 @router.get("/role-resumes")
 def list_role_resumes() -> dict[str, Any]:
     """List files under ``role_resumes/`` and keyword titles that reference each file."""
@@ -636,6 +727,110 @@ def delete_role_resume(request: Request, filename: str) -> dict[str, Any]:
     return {"ok": True, "deleted": filename}
 
 
+def _safe_pack_resume_basename(name: str) -> str | None:
+    """Return basename for ``role_resumes/<basename>`` zip entries, or None if unsafe."""
+    n = name.replace("\\", "/").strip("/")
+    if ".." in n or not n.startswith("role_resumes/"):
+        return None
+    base = n.split("/", 1)[1]
+    if not base or "/" in base or base.startswith("."):
+        return None
+    if not re.match(r"^[a-zA-Z0-9._-]+$", base):
+        return None
+    return base
+
+
+@router.get("/role-resumes/pack")
+def export_role_resumes_pack(request: Request) -> StreamingResponse:
+    """Zip ``role_resumes/*`` + ``job_interests.yaml`` for copying to another machine."""
+    require_local(request)
+    ensure_dirs()
+    sync_job_interests_to_searches()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "version": 1,
+                    "kind": "job_runner_role_resumes",
+                    "app_version": __version__,
+                },
+                indent=0,
+            ),
+        )
+        if JOB_INTERESTS_PATH.is_file():
+            zf.write(JOB_INTERESTS_PATH, "job_interests.yaml")
+        ROLE_RESUMES_DIR.mkdir(parents=True, exist_ok=True)
+        for p in sorted(ROLE_RESUMES_DIR.iterdir()):
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            arc = f"role_resumes/{p.name}"
+            zf.write(p, arc)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="job_runner_role_resumes.zip"'},
+    )
+
+
+@router.post("/role-resumes/pack")
+async def import_role_resumes_pack(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    """Unpack a pack from ``export_role_resumes_pack`` (or compatible zip) into this data directory."""
+    require_local(request)
+    raw = await file.read()
+    if len(raw) > 50 * 1024 * 1024:
+        raise HTTPException(400, "Pack too large (max 50MB)")
+    if len(raw) < 22:
+        raise HTTPException(400, "Invalid or empty zip file")
+
+    ensure_dirs()
+    ROLE_RESUMES_DIR.mkdir(parents=True, exist_ok=True)
+
+    imported_raw: dict | None = None
+    files_written = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for info in zf.infolist():
+            name = info.filename.replace("\\", "/")
+            if name.endswith("/"):
+                continue
+            if name == "job_interests.yaml" or name.endswith("/job_interests.yaml"):
+                try:
+                    raw = yaml.safe_load(zf.read(info)) or {}
+                except (OSError, yaml.YAMLError, UnicodeDecodeError) as e:
+                    raise HTTPException(400, f"Invalid job_interests.yaml in zip: {e}") from e
+                if not isinstance(raw, dict):
+                    raise HTTPException(400, "job_interests.yaml must be a YAML mapping")
+                imported_raw = raw
+                continue
+            base = _safe_pack_resume_basename(name)
+            if base is None:
+                continue
+            dest = (ROLE_RESUMES_DIR / base).resolve()
+            if not str(dest).startswith(str(ROLE_RESUMES_DIR.resolve())):
+                continue
+            data = zf.read(info)
+            if len(data) > 12 * 1024 * 1024:
+                raise HTTPException(400, f"File too large in zip: {base}")
+            dest.write_bytes(data)
+            files_written += 1
+
+    stats: dict[str, Any] = {"ok": True, "files_written": files_written}
+    if imported_raw is not None:
+        try:
+            imported = JobInterestsFile.model_validate(imported_raw)
+        except ValueError as e:
+            raise HTTPException(400, f"Invalid job_interests.yaml: {e}") from e
+        m = _apply_imported_job_interests(imported)
+        stats["keywords_ensured"] = m["keywords_ensured"]
+        stats["resumes_linked"] = m["resumes_linked"]
+    else:
+        stats["note"] = "No job_interests.yaml in pack — files were copied only."
+
+    return stats
+
+
 @router.get("/paths")
 def paths_info() -> dict[str, Any]:
     load_env()
@@ -643,6 +838,7 @@ def paths_info() -> dict[str, Any]:
         "app_dir": str(APP_DIR),
         "db_path": str(DB_PATH),
         "searches_yaml": str(SEARCH_CONFIG_PATH),
+        "job_interests_yaml": str(JOB_INTERESTS_PATH),
         "profile_project": str(PROJECT_PROFILE_PATH),
         "profile_user": str(PROFILE_PATH),
         "resume_text": str(RESUME_PATH),

@@ -36,10 +36,30 @@ def _trusted_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
     return nets
 
 
+def _is_private_or_link_local_ip(host: str | None) -> bool:
+    """True for RFC1918, CGNAT, and typical LAN-only addresses (so home/office Wi‑Fi works)."""
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(ip.is_private or ip.is_link_local)
+
+
 def client_ip_trusted(host: str | None) -> bool:
-    """True for loopback, or when the client IP is in configured trusted CIDRs (e.g. Tailscale LAN)."""
+    """True for loopback, LAN private IPs (when enabled), or configured trusted CIDRs (e.g. Tailscale)."""
     if client_is_local(host):
         return True
+    try:
+        from job_runner.config import load_env
+
+        load_env()
+    except Exception:
+        pass
+    if os.environ.get("JOB_RUNNER_TRUST_LAN", "").strip().lower() in ("1", "true", "yes"):
+        if _is_private_or_link_local_ip(host):
+            return True
     nets = _trusted_networks()
     if not host or not nets:
         return False

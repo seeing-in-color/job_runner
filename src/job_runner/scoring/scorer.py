@@ -1236,19 +1236,24 @@ def run_scoring(
         else _score_print_candidate_profile_enabled()
     )
     criteria = load_scoring_criteria()
-    profile = _load_profile_for_scoring()
-    if not profile:
-        console.print()
-        console.print(
-            Panel(
-                _example_defaults_block(),
-                title="Profile status",
-                border_style="yellow",
-                expand=False,
+    # Uploads-only scoring never merges profile.json into the candidate profile; skip loading
+    # to avoid noisy warnings and the misleading "example defaults" panel.
+    if criteria.fallback_to_profile_resume:
+        profile = _load_profile_for_scoring()
+        if not profile:
+            console.print()
+            console.print(
+                Panel(
+                    _example_defaults_block(),
+                    title="Profile status",
+                    border_style="yellow",
+                    expand=False,
+                )
             )
-        )
-    elif profile_has_placeholders(profile):
-        print_profile_placeholder_warning()
+        elif profile_has_placeholders(profile):
+            print_profile_placeholder_warning()
+    else:
+        profile = {}
 
     if not criteria.fallback_to_profile_resume:
         console.print(
@@ -1301,6 +1306,7 @@ def run_scoring(
             )
         jobs = kept_jobs
 
+    skipped_upload = 0
     if not criteria.fallback_to_profile_resume:
         n_before = len(jobs)
         jobs = [
@@ -1317,6 +1323,19 @@ def run_scoring(
     if not jobs:
         if eff_verbose:
             log.info("No jobs to score after filters.")
+        if skipped_upload > 0:
+            console.print()
+            console.print(
+                Panel(
+                    "All queued jobs were skipped because uploads-only mode requires a file in "
+                    "`role_resumes/` for each job's discovery keyword (see Find jobs). "
+                    "Either upload a résumé for each keyword or enable "
+                    "\"fallback to profile résumé\" in scoring criteria.",
+                    title="Nothing scored (0 LLM calls)",
+                    border_style="yellow",
+                    expand=False,
+                )
+            )
         return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
 
     if eff_print_profile:

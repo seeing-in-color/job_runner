@@ -771,10 +771,16 @@ def doctor() -> None:
 
 @app.command()
 def ui(
+    lan: bool = typer.Option(
+        False,
+        "--lan",
+        help="Listen on all interfaces (0.0.0.0) so another device (phone, MacBook) can open this UI. "
+        "Set JOB_RUNNER_TRUST_LAN=1 in ~/.job_runner/.env on this machine so uploads from those devices work.",
+    ),
     host: str = typer.Option(
         "127.0.0.1",
         "--host",
-        help="Bind address (default: localhost only).",
+        help="Bind address (use 0.0.0.0 or --lan for other devices on your network).",
     ),
     port: int = typer.Option(
         8844,
@@ -802,7 +808,7 @@ def ui(
     import threading
     import webbrowser
 
-    bind_host = host.strip() or "127.0.0.1"
+    bind_host = "0.0.0.0" if lan else (host.strip() or "127.0.0.1")
     bind_port = max(1, min(65535, int(port)))
     os.environ["JOB_RUNNER_UI_HOST"] = bind_host
     os.environ["JOB_RUNNER_UI_PORT"] = str(bind_port)
@@ -815,6 +821,12 @@ def ui(
     open_host = "127.0.0.1" if bind_host in ("0.0.0.0", "::") else bind_host
     url = f"http://{open_host}:{bind_port}/"
     console.print(f"[bold]Job Runner UI[/bold] -> {url}")
+    if bind_host in ("0.0.0.0", "::"):
+        console.print(
+            "[dim]LAN: open this UI from another device using http://<this-computer-ip>:"
+            f"{bind_port}/ — add JOB_RUNNER_TRUST_LAN=1 to ~/.job_runner/.env here so PDF uploads from "
+            "that device are allowed.[/dim]"
+        )
 
     env_skip = os.environ.get("JOB_RUNNER_UI_NO_BROWSER", "").strip().lower() in ("1", "true", "yes")
     # Reload uses a supervisor process; skip auto-open to avoid duplicate or wrong-process opens.

@@ -124,6 +124,27 @@ async function loadMeta() {
     const j = await r.json();
     const el = $("#app-version");
     if (el) el.textContent = "v" + (j.version || "?") + " · Tier " + (j.tier ?? "?");
+    const sd = $("#sidebar-data");
+    if (sd) {
+      const host = j.hostname || "this computer";
+      const rr = j.role_resumes_dir || "";
+      const localUi = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+      const trust = !!j.trust_lan;
+      sd.hidden = false;
+      const portHint = localUi ? "8844" : window.location.port || "8844";
+      sd.innerHTML = `
+        <div class="sidebar-data__title">PDF storage (CLI uses this too)</div>
+        <div class="sidebar-data__host" title="${esc(rr)}"><strong>${esc(host)}</strong></div>
+        <div class="sidebar-data__path">${esc(rr.replace(/\\/g, "/").split("/").slice(-3).join("/"))}</div>
+        ${
+          localUi
+            ? `<p class="sidebar-data__hint">Using the UI on <strong>this</strong> machine — PDFs stay here. To upload from a MacBook into a <strong>Windows</strong> PC’s CLI, open <code>http://&lt;that-PC-ip&gt;:${esc(String(portHint))}/</code> in the Mac browser (run <code>job_runner ui --lan</code> on the PC and set <code>JOB_RUNNER_TRUST_LAN=1</code> in its <code>.env</code>).</p>`
+            : trust
+              ? `<p class="sidebar-data__hint sidebar-data__hint--ok">Remote browser — uploads go to <strong>${esc(host)}</strong> (where the CLI runs).</p>`
+              : `<p class="sidebar-data__hint sidebar-data__hint--warn">If uploads return 403, add <code>JOB_RUNNER_TRUST_LAN=1</code> to <code>~/.job_runner/.env</code> on <strong>${esc(host)}</strong> and restart the UI.</p>`
+        }
+      `;
+    }
   } catch (_) {}
   refreshUsage();
 }
@@ -635,12 +656,16 @@ function buildResultRowHtml(row) {
       ? `<button type="button" class="btn btn-ghost" data-why="${escAttr(url)}">Why</button>`
       : "—";
   const trk = trackSelectHtml(url, row.application_track);
-  const sq = esc((row.search_query || "").slice(0, 48) || "—");
+  const sqFull = String(row.search_query || "").trim();
+  const sq = esc(sqFull ? sqFull.slice(0, 48) : "—");
+  const linkBtn = sqFull
+    ? `<button type="button" class="btn btn-ghost btn-tiny results-link-resume" data-link-sq="${escAttr(sqFull)}" title="Link a résumé for this discovery keyword">Link</button>`
+    : "";
   return `<tr data-url="${escAttr(url)}">
     <td><a href="${escAttr(url)}" target="_blank" rel="noopener">${title}</a>${roleStar}</td>
     <td>${esc(row.site || "—")}</td>
     <td>${pill}</td>
-    <td class="cell-muted">${sq}</td>
+    <td class="cell-muted cell-job-search"><div class="job-search-cell"><span class="job-search-text">${sq}</span>${linkBtn}</div></td>
     <td class="cell-track">${trk}</td>
     <td>${why}</td>
   </tr>`;
@@ -861,6 +886,149 @@ const jobCache = new Map();
 
 function findJobRowByUrl(url) {
   return jobCache.get(url);
+}
+
+let modalLinkResumeKeyword = "";
+
+function closeLinkResumeModal() {
+  const modal = $("#modal-link-resume");
+  const st = $("#modal-link-resume-status");
+  const fi = $("#modal-link-resume-file");
+  if (modal) modal.classList.remove("open");
+  modalLinkResumeKeyword = "";
+  if (st) st.textContent = "";
+  if (fi) fi.value = "";
+}
+
+async function openLinkResumeModal(searchQuery) {
+  const modal = $("#modal-link-resume");
+  const kwEl = $("#modal-link-resume-kw");
+  const sel = $("#modal-link-resume-select");
+  const st = $("#modal-link-resume-status");
+  if (!modal || !kwEl || !sel) return;
+  modalLinkResumeKeyword = String(searchQuery || "").trim();
+  if (!modalLinkResumeKeyword) return;
+  kwEl.textContent = modalLinkResumeKeyword;
+  if (st) st.textContent = "Loading files…";
+  sel.innerHTML = '<option value="">—</option>';
+  try {
+    const r = await api("/role-resumes");
+    const j = await r.json();
+    const files = j.files || [];
+    for (const f of files) {
+      const fn = f.filename;
+      if (!fn) continue;
+      const o = document.createElement("option");
+      o.value = fn;
+      o.textContent = fn;
+      sel.appendChild(o);
+    }
+    if (st) st.textContent = files.length ? "" : "No files yet — upload one below.";
+  } catch (e) {
+    if (st) st.textContent = String(e.message || e);
+  }
+  modal.classList.add("open");
+}
+
+async function submitLinkResumeExisting() {
+  const st = $("#modal-link-resume-status");
+  const sel = $("#modal-link-resume-select");
+  if (!modalLinkResumeKeyword) return;
+  const fn = sel && sel.value;
+  if (!fn) {
+    if (st) st.textContent = "Pick a file or upload a new one.";
+    return;
+  }
+  if (st) st.textContent = "Saving…";
+  try {
+    const r = await api("/interests/link", {
+      method: "POST",
+      body: JSON.stringify({ search_query: modalLinkResumeKeyword, resume_filename: fn }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiDetailMessage(j));
+    if (st) st.textContent = "Linked.";
+    closeLinkResumeModal();
+    await resetAndFetchResults();
+  } catch (e) {
+    if (st) st.textContent = String(e.message || e);
+  }
+}
+
+async function submitLinkResumeUpload() {
+  const st = $("#modal-link-resume-status");
+  const fi = $("#modal-link-resume-file");
+  if (!modalLinkResumeKeyword || !fi || !fi.files || !fi.files[0]) {
+    if (st) st.textContent = "Choose a file to upload.";
+    return;
+  }
+  if (st) st.textContent = "Uploading…";
+  const fd = new FormData();
+  fd.append("keyword", modalLinkResumeKeyword);
+  fd.append("file", fi.files[0]);
+  try {
+    const r = await fetch("/api/interests/upload", { method: "POST", credentials: "same-origin", body: fd });
+    await handleApiResponse401(r);
+    if (r.status === 401) return;
+    const j = await r.json();
+    if (!r.ok) throw new Error(apiDetailMessage(j));
+    if (st) st.textContent = j.filename ? "Saved: " + j.filename : "Saved.";
+    fi.value = "";
+    closeLinkResumeModal();
+    await resetAndFetchResults();
+  } catch (e) {
+    if (st) st.textContent = String(e.message || e);
+  }
+}
+
+async function downloadRoleResumesPack() {
+  const st = $("#settings-pack-status");
+  if (st) st.textContent = "Preparing…";
+  try {
+    const r = await fetch("/api/role-resumes/pack", { credentials: "same-origin" });
+    await handleApiResponse401(r);
+    if (r.status === 401) return;
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(apiDetailMessage(j));
+    }
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "job_runner_role_resumes.zip";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    if (st) st.textContent = "Download started.";
+    setTimeout(() => {
+      if (st && st.textContent === "Download started.") st.textContent = "";
+    }, 4000);
+  } catch (e) {
+    if (st) st.textContent = String(e.message || e);
+  }
+}
+
+async function importRoleResumesPack(file) {
+  const st = $("#settings-pack-status");
+  if (!file) return;
+  if (st) st.textContent = "Importing…";
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("/api/role-resumes/pack", { method: "POST", credentials: "same-origin", body: fd });
+    await handleApiResponse401(r);
+    if (r.status === 401) return;
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiDetailMessage(j));
+    const parts = [];
+    if (j.files_written != null) parts.push(`${j.files_written} file(s) copied`);
+    if (j.resumes_linked != null) parts.push(`${j.resumes_linked} keyword link(s)`);
+    if (j.keywords_ensured != null && j.keywords_ensured > 0) parts.push(`${j.keywords_ensured} keyword(s) added to searches`);
+    if (j.note) parts.push(j.note);
+    if (st) st.textContent = parts.length ? parts.join(" · ") : "Import finished.";
+    await loadSettings();
+  } catch (e) {
+    if (st) st.textContent = String(e.message || e);
+  }
 }
 
 async function loadSettings() {
@@ -1102,6 +1270,16 @@ function wireNav() {
     $("#modal-why").addEventListener("click", (ev) => {
       if (ev.target.id === "modal-why") $("#modal-why").classList.remove("open");
     });
+  $("#modal-link-resume-close") &&
+    $("#modal-link-resume-close").addEventListener("click", closeLinkResumeModal);
+  $("#modal-link-resume") &&
+    $("#modal-link-resume").addEventListener("click", (ev) => {
+      if (ev.target.id === "modal-link-resume") closeLinkResumeModal();
+    });
+  $("#modal-link-resume-apply") &&
+    $("#modal-link-resume-apply").addEventListener("click", () => void submitLinkResumeExisting());
+  $("#modal-link-resume-upload") &&
+    $("#modal-link-resume-upload").addEventListener("click", () => void submitLinkResumeUpload());
 }
 
 function wireResultsSection() {
@@ -1113,6 +1291,11 @@ function wireResultsSection() {
   sec.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-why]");
     if (btn) openWhy(btn.getAttribute("data-why"));
+    const linkBtn = ev.target.closest(".results-link-resume");
+    if (linkBtn) {
+      const sq = linkBtn.getAttribute("data-link-sq");
+      if (sq) void openLinkResumeModal(sq);
+    }
   });
   sec.addEventListener("change", (ev) => {
     const sel = ev.target.closest(".track-select");
@@ -1120,6 +1303,20 @@ function wireResultsSection() {
     const url = sel.getAttribute("data-track-url");
     if (url) postJobTrack(url, sel.value);
   });
+}
+
+function wireSettingsRolePack() {
+  $("#btn-export-role-pack") &&
+    $("#btn-export-role-pack").addEventListener("click", () => void downloadRoleResumesPack());
+  const inp = $("#input-import-role-pack");
+  if (inp) {
+    inp.addEventListener("change", (ev) => {
+      const t = ev.target;
+      const f = t && t.files && t.files[0];
+      if (t) t.value = "";
+      if (f) void importRoleResumesPack(f);
+    });
+  }
 }
 
 function wireSettingsResumes() {
@@ -1169,6 +1366,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   wireNav();
   wireResultsSection();
   wireSettingsResumes();
+  wireSettingsRolePack();
   wireFindSlotsSection();
   wireApplyModelControls();
   loadApplyPrefs();

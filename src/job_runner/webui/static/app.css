@@ -71,6 +71,53 @@ a:hover {
   margin-top: 0.25rem;
 }
 
+.sidebar-data {
+  margin-top: 0.65rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--muted);
+  max-width: 14rem;
+}
+
+.sidebar-data__title {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 0.74rem;
+  margin-bottom: 0.35rem;
+}
+
+.sidebar-data__host {
+  word-break: break-word;
+}
+
+.sidebar-data__path {
+  font-size: 0.68rem;
+  opacity: 0.9;
+  margin-bottom: 0.4rem;
+  word-break: break-all;
+}
+
+.sidebar-data__hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.sidebar-data__hint code {
+  font-size: 0.65rem;
+  word-break: break-all;
+}
+
+.sidebar-data__hint--ok {
+  color: var(--ok);
+}
+
+.sidebar-data__hint--warn {
+  color: var(--warn);
+}
+
 .nav-btn {
   display: block;
   width: 100%;
@@ -612,6 +659,19 @@ table.data.data--compact td {
   opacity: 0.95;
 }
 
+.settings-pack-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.settings-pack-import {
+  cursor: pointer;
+  margin: 0;
+}
+
 .settings-resumes {
   overflow-x: auto;
 }
@@ -668,6 +728,44 @@ table.data.data--compact td {
 
 .modal.modal-why {
   max-width: min(52rem, 96vw);
+}
+
+.modal.modal-link-resume {
+  max-width: min(36rem, 96vw);
+}
+
+.job-search-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.5rem;
+}
+
+.job-search-cell .job-search-text {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.modal-link-kw {
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.65rem;
+  background: var(--surface2);
+  border-radius: 8px;
+  font-size: 0.88rem;
+  word-break: break-word;
+}
+
+.modal-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.modal-link-row .results-inline-select {
+  flex: 1 1 12rem;
+  min-width: 0;
 }
 
 .modal header {

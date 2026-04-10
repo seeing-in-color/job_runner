@@ -12,6 +12,7 @@
         <div class="brand">
           <h1>Job Runner</h1>
           <div class="ver" id="app-version">…</div>
+          <div class="sidebar-data" id="sidebar-data" aria-live="polite" hidden></div>
         </div>
         <button type="button" class="nav-btn active" data-section="dashboard">Dashboard</button>
         <button type="button" class="nav-btn" data-section="find">Find jobs</button>
@@ -51,8 +52,9 @@
         <section id="section-find" class="section">
           <h2>Find jobs</h2>
           <p class="lead find-lead">
-            Up to <strong>10</strong> discovery keywords. Each row is a job title; pick an existing résumé from the list or
-            <strong>Upload</strong> a new file (save runs first). Selections are stored per keyword for scoring.
+            Up to <strong>10</strong> discovery keywords. Each row is a job title; pick a résumé or <strong>Upload</strong> a
+            PDF (save runs first). Files are stored on the <strong>computer running this UI</strong> — same place the CLI
+            uses — see the sidebar under “PDF storage”.
           </p>
 
           <div class="find-compact panel">
@@ -159,7 +161,9 @@
           <h2>Results</h2>
           <p class="lead">
             Open <strong>Why</strong> for per-criterion scores. <span class="find-hint">*</span> next to a title means that
-            listing was found with a search keyword that has a role-specific résumé uploaded.
+            listing was found with a search keyword that has a role-specific résumé uploaded. Use
+            <strong>Link</strong> in the Job search column to attach a résumé to that keyword anytime (needed for
+            uploads-only scoring).
           </p>
           <div class="results-toolbar">
             <div class="results-search-wrap">
@@ -256,12 +260,53 @@
 
         <section id="section-settings" class="section">
           <h2>Settings</h2>
-          <p class="lead">Paths and tier. API keys live in <code>~/.job_runner/.env</code> (not shown here).</p>
+          <p class="lead">
+            Paths and tier. API keys live in <code>~/.job_runner/.env</code> (not shown here). Keyword ↔ résumé
+            mappings and uploaded files live under <strong>app_dir</strong> below (<code>job_interests_yaml</code>,
+            <code>role_resumes_dir</code>) — they are <strong>local</strong> unless you point
+            <code>JOB_RUNNER_DIR</code> at a cloud-synced folder (OneDrive, iCloud Drive, Dropbox, etc.) or back up
+            those paths when switching machines.
+          </p>
+          <div class="panel">
+            <h3>Dropbox (or any sync folder) — no API needed</h3>
+            <p class="hint">
+              Install the <strong>Dropbox desktop app</strong> on the Mac and the PC (free tier is fine). Create a folder
+              in Dropbox, e.g. <code>JobRunnerData</code>. On <strong>each</strong> machine, set environment variable
+              <code>JOB_RUNNER_DIR</code> to that folder’s full path (Mac and Windows paths differ). Restart the terminal
+              / app. Then the Mac UI and the Windows CLI both use the same synced data — uploads on the Mac appear on
+              Windows after Dropbox syncs. No Dropbox API keys or OAuth.
+            </p>
+            <p class="hint">
+              <strong>Windows (User or System env):</strong>
+              <code>JOB_RUNNER_DIR=C:\Users\You\Dropbox\JobRunnerData</code>
+              <br />
+              <strong>Mac (shell profile or launchctl):</strong>
+              <code>export JOB_RUNNER_DIR=/Users/You/Library/CloudStorage/Dropbox/JobRunnerData</code> (your Dropbox path
+              may be <code>~/Dropbox/JobRunnerData</code> depending on how Dropbox is installed.)
+            </p>
+          </div>
           <p id="settings-tier" style="color: var(--muted)"></p>
           <div class="panel paths-list" id="settings-paths"></div>
           <div class="panel" id="settings-resumes-panel">
             <h3>Role résumés</h3>
-            <p class="hint">Uploaded files and the search keywords that use each file.</p>
+            <p class="hint">
+              Uploaded files and the search keywords that use each file. If the UI runs on another computer (e.g. server on
+              Windows, you on Mac), use a <strong>pack</strong>: on the machine that has the résumés, click
+              <strong>Download résumé pack</strong>, copy the zip to the server (AirDrop, USB, shared folder), then
+              <strong>Import pack</strong> there so keyword ↔ file mappings apply on that instance.
+            </p>
+            <p class="hint">
+              Or open this app’s URL from the Mac browser (same Wi‑Fi/VPN as the Windows host, e.g.
+              <code>http://192.168.x.x:PORT</code>) and use <strong>Find jobs</strong> — uploads go to the server directly.
+            </p>
+            <div class="form-row settings-pack-row">
+              <button type="button" class="btn" id="btn-export-role-pack">Download résumé pack (.zip)</button>
+              <label class="btn btn-ghost settings-pack-import">
+                Import pack
+                <input type="file" id="input-import-role-pack" accept=".zip,application/zip" hidden />
+              </label>
+              <span class="status-bar" id="settings-pack-status"></span>
+            </div>
             <div id="settings-resumes" class="settings-resumes"></div>
             <p class="status-bar" id="settings-resumes-status"></p>
           </div>
@@ -298,6 +343,30 @@
           <button type="button" class="btn btn-ghost" id="modal-why-close">Close</button>
         </header>
         <div class="body" id="modal-why-body"></div>
+      </div>
+    </div>
+
+    <div id="modal-link-resume" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-link-resume-title">
+      <div class="modal modal-link-resume">
+        <header>
+          <h3 id="modal-link-resume-title">Link résumé to keyword</h3>
+          <button type="button" class="btn btn-ghost" id="modal-link-resume-close">Close</button>
+        </header>
+        <div class="body">
+          <p class="hint">Discovery keyword (from this job):</p>
+          <p id="modal-link-resume-kw" class="modal-link-kw"></p>
+          <div class="form-row modal-link-row">
+            <label for="modal-link-resume-select">Use existing file</label>
+            <select id="modal-link-resume-select" class="results-inline-select"></select>
+            <button type="button" class="btn" id="modal-link-resume-apply">Link selected</button>
+          </div>
+          <p class="hint">Or upload a new file (PDF, DOCX, TXT, …):</p>
+          <div class="form-row modal-link-row">
+            <input type="file" id="modal-link-resume-file" accept=".pdf,.doc,.docx,.txt,.md,.rtf" />
+            <button type="button" class="btn btn-ghost" id="modal-link-resume-upload">Upload &amp; attach</button>
+          </div>
+          <p class="status-bar" id="modal-link-resume-status"></p>
+        </div>
       </div>
     </div>
 
