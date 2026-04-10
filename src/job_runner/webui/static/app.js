@@ -560,7 +560,18 @@ async function runScore() {
     await saveCriteriaInternal();
     if (status) status.textContent = "Starting score…";
     terminalAppend("\n── " + new Date().toLocaleString() + " ──\n");
-    const r = await api("/pipeline/run", { method: "POST", body: JSON.stringify({ stages: ["score"] }) });
+    let scoreProvider = null;
+    let scoreModel = null;
+    const preset = $("#score-model-preset");
+    if (preset && preset.value && preset.value.includes("|")) {
+      const parts = preset.value.split("|", 2);
+      scoreProvider = (parts[0] || "").trim();
+      scoreModel = (parts[1] || "").trim();
+    }
+    const payload = { stages: ["score"] };
+    if (scoreProvider) payload.score_provider = scoreProvider;
+    if (scoreModel) payload.score_model = scoreModel;
+    const r = await api("/pipeline/run", { method: "POST", body: JSON.stringify(payload) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(apiDetailMessage(j) || r.statusText || "Run failed");
     const tid = j.task_id;

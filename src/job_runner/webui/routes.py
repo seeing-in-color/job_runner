@@ -663,6 +663,8 @@ class PipelineBody(BaseModel):
     chunk_size: int | None = Field(25, ge=1, le=500)
     chunk_delay: float | None = Field(5.0, ge=0.0, le=120.0)
     score_verbose: bool = False
+    score_provider: str | None = Field(None, description="openai | gemini | anthropic")
+    score_model: str | None = Field(None, description="Model id used by score/tailor/cover stages")
 
 
 class ApplyBody(BaseModel):
@@ -679,7 +681,14 @@ class ApplyBody(BaseModel):
 def post_pipeline_run(request: Request, body: PipelineBody) -> dict[str, Any]:
     require_local(request)
     cmd = build_run_command(body.model_dump())
-    tid = start_pipeline_task(cmd)
+    stages = {str(s).lower() for s in (body.stages or [])}
+    is_llm_pipeline = bool(("all" in stages) or {"score", "tailor", "cover"} & stages)
+    env_overrides: dict[str, str] = {}
+    if is_llm_pipeline and body.score_provider:
+        env_overrides["LLM_PROVIDER"] = body.score_provider.strip().lower()
+    if is_llm_pipeline and body.score_model:
+        env_overrides["LLM_MODEL"] = body.score_model.strip()
+    tid = start_pipeline_task(cmd, env_overrides=env_overrides or None)
     return {"ok": True, "task_id": tid, "command": cmd}
 
 

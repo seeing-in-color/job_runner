@@ -95,7 +95,12 @@ def get_task(task_id: str) -> dict[str, Any] | None:
         return _tasks.get(task_id)
 
 
-def start_pipeline_task(cmd: list[str], *, cwd: Path | None = None) -> str:
+def start_pipeline_task(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> str:
     """Run ``cmd`` in a background thread; stream combined stdout into ``log``."""
     tid = uuid.uuid4().hex
     root = cwd or repo_root()
@@ -122,6 +127,8 @@ def start_pipeline_task(cmd: list[str], *, cwd: Path | None = None) -> str:
                 "bufsize": 1,
                 "env": _pipeline_env(),
             }
+            if env_overrides:
+                pop_kw["env"].update({str(k): str(v) for k, v in env_overrides.items()})
             if sys.platform == "win32":
                 pop_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:

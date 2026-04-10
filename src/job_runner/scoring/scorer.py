@@ -1252,7 +1252,7 @@ def run_scoring(
 
     if not criteria.fallback_to_profile_resume:
         console.print(
-            "[dim]Scoring uses only uploaded keyword résumés (Find jobs → role_resumes/); "
+            "[dim]Scoring uses only uploaded keyword resumes (Find jobs -> role_resumes/); "
             "jobs without a matching file for their discovery keyword are skipped.[/dim]"
         )
 

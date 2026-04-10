@@ -65,6 +65,7 @@ def _detect_provider() -> tuple[str, str, str]:
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
+    openai_base = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
@@ -74,7 +75,7 @@ def _detect_provider() -> tuple[str, str, str]:
         if provider_override == "openai":
             if not openai_key:
                 raise RuntimeError("LLM_PROVIDER=openai but OPENAI_API_KEY is missing.")
-            return ("https://api.openai.com/v1", model_override or "gpt-4o-mini", openai_key)
+            return (openai_base.rstrip("/"), model_override or "gpt-4o-mini", openai_key)
         if provider_override == "gemini":
             if not gemini_key:
                 raise RuntimeError("LLM_PROVIDER=gemini but GEMINI_API_KEY is missing.")
@@ -92,7 +93,7 @@ def _detect_provider() -> tuple[str, str, str]:
     # Prefer OpenAI when OPENAI_API_KEY is set (scoring + all LLM stages use this client).
     if openai_key and not local_url:
         return (
-            "https://api.openai.com/v1",
+            openai_base.rstrip("/"),
             model_override or "gpt-4o-mini",
             openai_key,
         )

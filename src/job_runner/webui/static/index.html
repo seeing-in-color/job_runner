@@ -139,6 +139,14 @@
             </div>
             <div class="form-row">
               <button type="button" class="btn" id="btn-save-criteria">Save</button>
+              <label for="score-model-preset" title="Choose which AI brain to use for scoring.">
+                Score model
+                <select id="score-model-preset" class="results-inline-select">
+                  <option value="openai|deepseek-chat">DeepSeek Chat (~$0.0007/1K tok)</option>
+                  <option value="openai|gpt-4o-mini">OpenAI GPT-4o mini (~$0.00075/1K tok)</option>
+                  <option value="anthropic|claude-3-5-haiku-latest">Claude Haiku (~$0.0048/1K tok)</option>
+                </select>
+              </label>
               <button type="button" class="btn" id="btn-run-score" title="Save criteria, then run the score stage (same as job_runner run score)">
                 Run score
               </button>
