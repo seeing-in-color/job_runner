@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -14,6 +15,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -27,6 +29,16 @@ def load_dotenv(path: Path) -> dict[str, str]:
         k, v = line.split("=", 1)
         out[k.strip()] = v.strip()
     return out
+
+
+def _parse_github_owner_repo(url: str) -> tuple[str, str] | None:
+    if not url or "github.com" not in url.lower():
+        return None
+    m = re.search(r"github\.com[:/]([^/]+)/([^/\s#]+)", url, re.I)
+    if not m:
+        return None
+    repo = m.group(2).removesuffix(".git")
+    return m.group(1), repo
 
 
 class Daemon:
@@ -59,6 +71,8 @@ class Daemon:
         self.remote_proc: subprocess.Popen[str] | None = None
         self.desired_running = True
         self.last_ping_ts = 0.0
+        self._update_in_progress = False
+        self._last_github_auto_check_ts = 0.0
 
         self.reload_env()
 
@@ -394,11 +408,145 @@ class Daemon:
         except Exception as e:
             return False, str(e)
 
+    def _github_owner_repo(self) -> tuple[str, str] | None:
+        override = os.environ.get("JOB_RUNNER_GITHUB_REPO", "").strip()
+        if override and "/" in override:
+            a, b = override.split("/", 1)
+            a, b = a.strip(), b.strip()
+            if a and b:
+                return a, b.removesuffix(".git")
+        try:
+            r = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=os.environ.copy(),
+            )
+            if r.returncode != 0:
+                return None
+            return _parse_github_owner_repo((r.stdout or "").strip())
+        except Exception:
+            return None
+
+    def _git_local_head_sha(self) -> str | None:
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=os.environ.copy(),
+            )
+            if r.returncode != 0:
+                return None
+            s = (r.stdout or "").strip()
+            return s[:40] if len(s) >= 7 else None
+        except Exception:
+            return None
+
+    def _github_remote_head_sha(self, owner: str, repo: str, branch: str) -> str | None:
+        token = os.environ.get("JOB_RUNNER_GITHUB_TOKEN", "").strip()
+        path = f"/repos/{owner}/{repo}/commits/{quote(branch, safe='')}"
+        url = f"https://api.github.com{path}"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("User-Agent", "job-runner-daemon")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as res:
+                data = json.loads(res.read().decode("utf-8", errors="replace"))
+            sha = str(data.get("sha", "") or "").strip()
+            return sha[:40] if len(sha) >= 7 else None
+        except Exception as e:
+            self.log(f"GitHub API commits/{branch}: {e}")
+            return None
+
+    def _run_deploy_pipeline(self) -> tuple[bool, str]:
+        """git pull + optional pip + reload_env + restart UI. Returns (ok, detail text)."""
+        ok, out = self._git_pull()
+        if not ok:
+            return False, out
+        pip_ok, pip_out = self._maybe_pip_install_editable()
+        if not pip_ok:
+            return False, f"pip install -e . failed:\n{pip_out}"
+        self.reload_env()
+        self.restart_ui()
+        msg = f"git pull OK:\n\n{out}"
+        if pip_out:
+            msg += f"\n\npip:\n{pip_out}"
+        return True, msg
+
+    def _maybe_github_auto_update(self) -> None:
+        """Poll GitHub for new commits on the tracked branch; pull and restart when ahead."""
+        if os.environ.get("JOB_RUNNER_AUTO_UPDATE_FROM_GITHUB", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return
+        if self._update_in_progress:
+            return
+        try:
+            interval = float(os.environ.get("JOB_RUNNER_AUTO_UPDATE_INTERVAL_SEC", "120") or "120")
+        except (TypeError, ValueError):
+            interval = 120.0
+        interval = max(60.0, min(interval, 3600.0))
+        now = time.time()
+        if now - self._last_github_auto_check_ts < interval:
+            return
+        self._last_github_auto_check_ts = now
+
+        self.reload_env()
+        pair = self._github_owner_repo()
+        if not pair:
+            self.log(
+                "AUTO_UPDATE: set JOB_RUNNER_GITHUB_REPO=owner/repo or use a github.com origin remote"
+            )
+            return
+        owner, repo = pair
+        branch = os.environ.get("JOB_RUNNER_GIT_BRANCH", "main").strip() or "main"
+        remote_sha = self._github_remote_head_sha(owner, repo, branch)
+        local_sha = self._git_local_head_sha()
+        if not remote_sha or not local_sha:
+            self.log(f"AUTO_UPDATE: could not read sha (remote={remote_sha!r} local={local_sha!r})")
+            return
+        if remote_sha == local_sha:
+            return
+
+        self.log(f"AUTO_UPDATE: GitHub has new commit {remote_sha[:7]} (local {local_sha[:7]}), deploying…")
+        self._update_in_progress = True
+        try:
+            ok, msg = self._run_deploy_pipeline()
+            note = f"Auto-update from GitHub ({remote_sha[:7]})\n\n{msg}"
+            if len(note) > 4000:
+                note = note[:3990] + "\n…(truncated)"
+            if ok:
+                self.log("AUTO_UPDATE: success")
+                if self.telegram_enabled:
+                    self.tg_send(note)
+                    self.tg_send("Restarted Job Runner UI — new code is live.")
+            else:
+                self.log(f"AUTO_UPDATE failed: {msg[:500]}")
+                if self.telegram_enabled:
+                    self.tg_send(f"Auto-update failed:\n\n{msg[:3800]}")
+        finally:
+            self._update_in_progress = False
+
     def _status_text(self) -> str:
         ui_alive = bool((self.ui_proc and self.ui_proc.poll() is None) or self._is_tcp_open(self.ui_host, self.ui_port))
         ui = "running" if ui_alive else "stopped"
         tunnel = "running" if self.tunnel_proc and self.tunnel_proc.poll() is None else "stopped"
         remote = "running" if self.remote_proc and self.remote_proc.poll() is None else "idle"
+        auto = os.environ.get("JOB_RUNNER_AUTO_UPDATE_FROM_GITHUB", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        iv = os.environ.get("JOB_RUNNER_AUTO_UPDATE_INTERVAL_SEC", "120")
         return (
             f"Job Runner daemon status\n"
             f"- desired_running: {self.desired_running}\n"
@@ -406,7 +554,8 @@ class Daemon:
             f"- tunnel: {tunnel}\n"
             f"- remote: {remote}\n"
             f"- host: {self.ui_host}:{self.ui_port}\n"
-            f"- tunnel_name: {self.tunnel_name}"
+            f"- tunnel_name: {self.tunnel_name}\n"
+            f"- auto_update_github: {auto} (interval {iv}s)"
         )
 
     def _start_remote(self) -> tuple[bool, str]:
@@ -461,6 +610,7 @@ class Daemon:
                 "/status\n/start\n/stop\n/restart_ui\n/restart_tunnel\n/restart_all\n/reload_env\n/reboot\n"
                 "/update\n/git_pull\n"
                 "/remote\n/remote_status\n/remote_stop\n/clip <text>\n\n"
+                "Auto-deploy: set JOB_RUNNER_AUTO_UPDATE_FROM_GITHUB=1 (polls GitHub, notifies here).\n\n"
                 "Clipboard from Telegram:\n"
                 "- Send plain text message -> copy text to Windows clipboard\n"
                 "- Send photo -> copy image to clipboard\n"
@@ -499,27 +649,26 @@ class Daemon:
             self.tg_send("Reloaded ~/.job_runner/.env")
             return
         if cmd in ("/update", "update", "/git_pull", "git_pull"):
+            if self._update_in_progress:
+                self.tg_send("Update already in progress (auto or manual).")
+                return
             self.tg_send("Running git pull…")
-            ok, out = self._git_pull()
-            if not ok:
-                summary = f"git pull failed (exit non-zero). Output:\n\n{out}"
-                if len(summary) > 4000:
-                    summary = summary[:3990] + "\n…(truncated)"
+            self._update_in_progress = True
+            try:
+                ok, msg = self._run_deploy_pipeline()
+                if not ok:
+                    summary = f"Deploy failed:\n\n{msg}"
+                    if len(summary) > 4000:
+                        summary = summary[:3990] + "\n…(truncated)"
+                    self.tg_send(summary)
+                    return
+                summary = msg
+                if len(summary) > 3800:
+                    summary = summary[:3790] + "\n…(truncated)"
                 self.tg_send(summary)
-                return
-            pip_ok, pip_out = self._maybe_pip_install_editable()
-            if not pip_ok:
-                self.tg_send(f"pip install -e . failed:\n{pip_out[:3500]}")
-                return
-            self.reload_env()
-            self.restart_ui()
-            summary = f"git pull OK:\n\n{out}"
-            if pip_out:
-                summary += f"\n\npip:\n{pip_out}"
-            if len(summary) > 3800:
-                summary = summary[:3790] + "\n…(truncated)"
-            self.tg_send(summary)
-            self.tg_send("Restarted Job Runner UI — new code is live.")
+                self.tg_send("Restarted Job Runner UI — new code is live.")
+            finally:
+                self._update_in_progress = False
             return
         if cmd in ("/reboot", "reboot"):
             self.tg_send("Rebooting host in 5 seconds.")
@@ -590,6 +739,7 @@ class Daemon:
                     if not self.tunnel_proc or self.tunnel_proc.poll() is not None:
                         self.log("Tunnel stopped unexpectedly; restarting")
                         self._start_tunnel()
+                    self._maybe_github_auto_update()
 
                 now = time.time()
                 if self.telegram_enabled and now - self.last_ping_ts >= 2.0:
