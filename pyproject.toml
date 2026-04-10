@@ -1,5 +1,5 @@
 [project]
-name = "applypilot"
+name = "job_runner"
 version = "0.3.0"
 description = "AI-powered end-to-end job application pipeline"
 readme = "README.md"
@@ -40,28 +40,29 @@ webui = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "python-multipart>=0.0.9",
+    "itsdangerous>=2.0",
 ]
 # Kept for backward compatibility; python-jobspy is already a core dependency.
 discover = ["python-jobspy>=1.1.0,!=1.1.82"]
 dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]
-applypilot = "applypilot.cli:app"
+job_runner = "job_runner.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"
-Repository = "https://github.com/Pickle-Pixel/ApplyPilot"
-Issues = "https://github.com/Pickle-Pixel/ApplyPilot/issues"
+Homepage = "https://github.com/Pickle-Pixel/job_runner"
+Repository = "https://github.com/Pickle-Pixel/job_runner"
+Issues = "https://github.com/Pickle-Pixel/job_runner/issues"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/applypilot"]
+packages = ["src/job_runner"]
 
 [tool.hatch.build]
-artifacts = ["src/applypilot/config/*.yaml"]
+artifacts = ["src/job_runner/config/*.yaml"]
 
 [tool.ruff]
 target-version = "py311"

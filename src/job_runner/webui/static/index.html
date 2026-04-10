@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Runner</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <h1>Job Runner</h1>
+          <div class="ver" id="app-version">…</div>
+        </div>
+        <button type="button" class="nav-btn active" data-section="dashboard">Dashboard</button>
+        <button type="button" class="nav-btn" data-section="find">Find jobs</button>
+        <button type="button" class="nav-btn" data-section="score">Score</button>
+        <button type="button" class="nav-btn" data-section="results">Results</button>
+        <button type="button" class="nav-btn" data-section="settings">Settings</button>
+      </aside>
+      <main>
+        <div class="top-actions">
+          <div class="cost-tile" id="cost-tile" title="Estimated LLM spend from recorded token usage">
+            <div class="cost-tile__label">Est. API spend</div>
+            <div class="cost-tile__row">
+              <span class="cost-tile__value" id="cost-value">—</span>
+              <span class="cost-tile__meta" id="cost-meta"></span>
+            </div>
+          </div>
+          <div class="top-actions__right">
+            <button type="button" class="btn btn-ghost" id="btn-logout" hidden title="End browser session (shared password login)">
+              Sign out
+            </button>
+            <button type="button" class="btn btn-ghost" id="btn-restart" title="Free the UI port and start job_runner ui again">
+              Restart server
+            </button>
+          </div>
+        </div>
+
+        <section id="section-dashboard" class="section active">
+          <h2>Dashboard</h2>
+          <p class="lead">Pipeline snapshot from your local database. Run <strong>discover</strong> from <strong>Find jobs</strong> or score from your terminal.</p>
+          <div id="dash-stats" class="grid-stats"></div>
+          <p class="status-bar" id="dash-status"></p>
+        </section>
+
+        <section id="section-find" class="section">
+          <h2>Find jobs</h2>
+          <p class="lead find-lead">
+            Up to <strong>10</strong> discovery keywords. Each row is a job title; pick an existing résumé from the list or
+            <strong>Upload</strong> a new file (save runs first). Selections are stored per keyword for scoring.
+          </p>
+
+          <div class="find-compact panel">
+            <div class="find-compact__grid">
+              <div class="find-compact__block">
+                <div class="find-compact__h">Boards</div>
+                <div id="find-boards" class="chk-grid chk-grid--tight"></div>
+              </div>
+              <div class="find-compact__block">
+                <div class="find-compact__h">Sources</div>
+                <label class="find-inline"><input type="checkbox" id="find-run-jobspy" checked /> JobSpy boards</label>
+                <label class="find-inline"><input type="checkbox" id="find-run-workday" checked /> Workday</label>
+                <label class="find-inline"><input type="checkbox" id="find-run-smartextract" checked /> Smart extract</label>
+              </div>
+              <div class="find-compact__block">
+                <div class="find-compact__h">Location</div>
+                <label class="find-inline">City <input type="text" id="find-city" placeholder="Austin, TX" class="find-input-sm" /></label>
+                <label class="find-inline"><input type="checkbox" id="find-include-remote" checked /> Remote</label>
+              </div>
+            </div>
+
+            <div class="find-slots-wrap">
+              <div class="find-compact__h">Job titles, extra search lines, &amp; résumés</div>
+              <div class="table-wrap find-slots-table-wrap">
+                <table class="data find-slots-table">
+                  <thead>
+                    <tr>
+                      <th class="find-slots-th-num">#</th>
+                      <th>Main title &amp; extra searches</th>
+                      <th class="find-slots-th-resume">Résumé</th>
+                    </tr>
+                  </thead>
+                  <tbody id="find-slots-tbody"></tbody>
+                </table>
+              </div>
+              <p class="status-bar" id="upload-status"></p>
+            </div>
+
+            <div class="find-compact__limits">
+              <label>Per board <input type="number" id="find-results-per-site" min="1" max="500" value="100" class="find-num" /></label>
+              <label>Hours ≤ <input type="number" id="find-hours-old" min="1" max="720" value="72" class="find-num" /></label>
+              <label>Country <input type="text" id="find-country" value="USA" class="find-num" /></label>
+            </div>
+
+            <div class="find-compact__actions">
+              <button type="button" class="btn" id="btn-save-find">Save</button>
+              <button type="button" class="btn" id="btn-run-discover" title="Save, then one discover run with every query at once">Run discover</button>
+              <button type="button" class="btn" id="btn-run-discover-slots" title="Save, then one discover run per saved query; runs up to 15 in parallel automatically">
+                Discover each slot
+              </button>
+              <span class="status-bar" id="find-status"></span>
+            </div>
+          </div>
+        </section>
+
+        <section id="section-score" class="section">
+          <h2>Score</h2>
+          <p class="lead">
+            Criteria in <code>scoring_criteria.json</code>; role résumés apply per discovery keyword. Save, then
+            <strong>Run score</strong>.
+          </p>
+          <div class="panel">
+            <h3>Criteria</h3>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-relevance" /> Search relevance vs discovery keyword</label>
+            </div>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-seniority" /> Seniority / years alignment</label>
+            </div>
+            <div class="form-row">
+              <label>Profile years: <input type="number" id="crit-years" min="0" max="60" step="1" /></label>
+            </div>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-travel" /> Drop &gt;25% travel before scoring</label>
+            </div>
+            <div class="form-row">
+              <label><input type="checkbox" id="crit-skills-gap" /> Strict required-skills gap</label>
+            </div>
+            <div class="form-row">
+              <label
+                ><input type="checkbox" id="crit-uploads-only" /> Only use uploaded keyword résumés (skip jobs with no
+                matching file; do not use profile <code>resume.txt</code>)</label
+              >
+            </div>
+            <div class="form-row">
+              <button type="button" class="btn" id="btn-save-criteria">Save</button>
+              <button type="button" class="btn" id="btn-run-score" title="Save criteria, then run the score stage (same as job_runner run score)">
+                Run score
+              </button>
+              <span class="status-bar" id="score-status"></span>
+            </div>
+          </div>
+        </section>
+
+        <section id="section-results" class="section">
+          <h2>Results</h2>
+          <p class="lead">
+            Open <strong>Why</strong> for per-criterion scores. <span class="find-hint">*</span> next to a title means that
+            listing was found with a search keyword that has a role-specific résumé uploaded.
+          </p>
+          <div class="results-toolbar">
+            <div class="results-search-wrap">
+              <label class="results-search-label" for="filter-q">Search titles</label>
+              <div class="results-search-field">
+                <svg class="results-search-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"
+                  />
+                </svg>
+                <input
+                  type="search"
+                  id="filter-q"
+                  placeholder="Filter by job title…"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+            </div>
+            <div class="results-toolbar__filters">
+              <label class="results-site-label" for="filter-site">Site</label>
+              <select id="filter-site" class="results-site-select">
+                <option value="">All sites</option>
+              </select>
+            </div>
+            <div class="results-toolbar__actions">
+              <button type="button" class="btn btn-ghost" id="btn-results-refresh">Refresh</button>
+              <details class="results-actions-menu" id="results-actions-menu">
+                <summary class="btn btn-ghost results-actions-summary">Delete…</summary>
+                <div class="results-actions-menu__panel" role="menu">
+                  <button type="button" class="results-actions-menu__item" id="btn-delete-scored" role="menuitem">
+                    Delete scored rows
+                  </button>
+                  <button type="button" class="results-actions-menu__item results-actions-menu__item--danger" id="btn-delete-all-jobs" role="menuitem">
+                    Delete all jobs
+                  </button>
+                </div>
+              </details>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>Title</th>
+                  <th>Site</th>
+                  <th class="results-th-score-wrap" scope="col" id="results-th-score-col" aria-sort="descending">
+                    <button
+                      type="button"
+                      class="results-th-sort"
+                      id="results-th-score"
+                      title="Sort by score — click to reverse"
+                    >
+                      Score <span class="results-th-sort-indicator" aria-hidden="true">↓</span>
+                    </button>
+                  </th>
+                  <th>Job search</th>
+                  <th>Track</th>
+                  <th>Why</th>
+                </tr>
+              </thead>
+              <tbody id="results-tbody"></tbody>
+            </table>
+            <div id="results-sentinel" class="results-sentinel" aria-hidden="true"></div>
+          </div>
+          <p class="status-bar" id="results-status"></p>
+        </section>
+
+        <section id="section-settings" class="section">
+          <h2>Settings</h2>
+          <p class="lead">Paths and tier. API keys live in <code>~/.job_runner/.env</code> (not shown here).</p>
+          <p id="settings-tier" style="color: var(--muted)"></p>
+          <div class="panel paths-list" id="settings-paths"></div>
+          <div class="panel" id="settings-resumes-panel">
+            <h3>Role résumés</h3>
+            <p class="hint">Uploaded files and the search keywords that use each file.</p>
+            <div id="settings-resumes" class="settings-resumes"></div>
+            <p class="status-bar" id="settings-resumes-status"></p>
+          </div>
+          <div class="form-row">
+            <button type="button" class="btn" id="btn-export-html">Export HTML dashboard</button>
+            <span class="status-bar" id="settings-export-status"></span>
+          </div>
+          <p class="lead" style="margin-top: 1rem">
+            After code changes, use <strong>Restart server</strong> if the UI port is stuck or the app is stale.
+          </p>
+        </section>
+      </main>
+    </div>
+
+    <div id="terminal-dock" class="terminal-dock" aria-label="Command output">
+        <div class="terminal-dock__bar">
+        <span class="terminal-dock__title">Terminal</span>
+        <div class="terminal-dock__actions">
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-repair-jobspy" title="Reinstall python-jobspy into this Python (same env as the server). Use when discover says JobSpy is missing or broken.">
+            Fix JobSpy
+          </button>
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-stop" title="Stop the running discover or score process">Stop</button>
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-clear" title="Clear output">Clear</button>
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-toggle" title="Show or hide output">Hide</button>
+        </div>
+      </div>
+      <pre id="terminal-output" class="terminal-dock__output" spellcheck="false"></pre>
+    </div>
+
+    <div id="modal-why" class="modal-overlay" role="dialog" aria-modal="true">
+      <div class="modal modal-why">
+        <header>
+          <h3>Why this score</h3>
+          <button type="button" class="btn btn-ghost" id="modal-why-close">Close</button>
+        </header>
+        <div class="body" id="modal-why-body"></div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

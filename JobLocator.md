@@ -20,7 +20,7 @@ This document describes the **JobLocator** work snapshot: web UI for discovery a
 
 - **`python-jobspy`** is a **core** dependency in `pyproject.toml` so a normal `uv sync` / `pip install -e .` installs the full `jobspy` package (including `jobspy.bayt`).
 - **Runtime check** in `discovery/jobspy.py` detects incomplete installs and raises an actionable error (wrong PyPI package `jobspy` vs `python-jobspy`, corrupt tree, etc.).
-- **`applypilot doctor`** messaging updated for JobSpy repair.
+- **`job_runner doctor`** messaging updated for JobSpy repair.
 
 ## Scoring
 
@@ -41,7 +41,7 @@ This document describes the **JobLocator** work snapshot: web UI for discovery a
 ## Operations
 
 - **Repair JobSpy in a venv:** `uv sync` or `pip install --force-reinstall 'python-jobspy>=1.1.0'`; if a wrong package was installed: `pip uninstall jobspy` then reinstall `python-jobspy`.
-- **Web UI + discover:** `pip install -e ".[webui]"` (or equivalent) and run `applypilot ui` as documented in the project README.
+- **Web UI + discover:** `pip install -e ".[webui]"` (or equivalent) and run `job_runner ui` as documented in the project README.
 
 ## Note
 

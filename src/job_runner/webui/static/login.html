@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in · Job Runner</title>
+    <link rel="stylesheet" href="/app.css" />
+    <style>
+      .login-wrap {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1.5rem;
+      }
+      .login-card {
+        width: 100%;
+        max-width: 380px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1.75rem;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+      }
+      .login-card h1 {
+        margin: 0 0 0.35rem;
+        font-size: 1.25rem;
+        letter-spacing: -0.02em;
+      }
+      .login-card p.lead {
+        margin: 0 0 1.25rem;
+        font-size: 0.875rem;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+      .login-card label {
+        display: block;
+        font-size: 0.8rem;
+        color: var(--muted);
+        margin-bottom: 0.35rem;
+      }
+      .login-card input[type="password"] {
+        width: 100%;
+        padding: 0.6rem 0.75rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--surface2);
+        color: var(--text);
+        font: inherit;
+        margin-bottom: 1rem;
+      }
+      .login-card input[type="password"]:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px var(--accent-dim);
+      }
+      .login-card .err {
+        font-size: 0.85rem;
+        color: var(--bad);
+        margin: -0.5rem 0 0.75rem;
+        min-height: 1.25rem;
+      }
+      .login-card .btn-primary {
+        width: 100%;
+        padding: 0.65rem 1rem;
+        border-radius: 8px;
+        border: none;
+        background: var(--accent);
+        color: #0a0d12;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .login-card .btn-primary:hover {
+        filter: brightness(1.08);
+      }
+      .login-card .btn-primary:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="login-wrap">
+      <div class="login-card">
+        <h1>Job Runner</h1>
+        <p class="lead">Enter the shared password to open the dashboard.</p>
+        <form id="login-form" autocomplete="current-password">
+          <label for="pw">Password</label>
+          <input type="password" id="pw" name="password" required autofocus />
+          <p class="err" id="err" aria-live="polite"></p>
+          <button type="submit" class="btn-primary" id="btn">Sign in</button>
+        </form>
+      </div>
+    </div>
+    <script>
+      (function () {
+        const form = document.getElementById("login-form");
+        const pw = document.getElementById("pw");
+        const err = document.getElementById("err");
+        const btn = document.getElementById("btn");
+
+        fetch("/api/session", { credentials: "same-origin" })
+          .then((r) => r.json())
+          .then((j) => {
+            if (j.auth_enabled === false) {
+              window.location.replace("/");
+              return;
+            }
+            if (j.authenticated) window.location.replace("/");
+          })
+          .catch(() => {});
+
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          err.textContent = "";
+          btn.disabled = true;
+          try {
+            const r = await fetch("/api/login", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ password: pw.value }),
+            });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok) {
+              err.textContent = j.detail || "Sign-in failed.";
+              btn.disabled = false;
+              return;
+            }
+            window.location.replace("/");
+          } catch (_) {
+            err.textContent = "Network error.";
+            btn.disabled = false;
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

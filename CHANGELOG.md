@@ -1,19 +1,27 @@
 # Changelog
 
-All notable changes to ApplyPilot will be documented in this file.
+All notable changes to Job Runner will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Optional **web UI login**: set `JOB_RUNNER_UI_PASSWORD` to require `/login.html` and a signed session cookie before using the dashboard or `/api/*` (shared master password). Use `JOB_RUNNER_UI_COOKIE_SECURE=1` behind HTTPS (e.g. Cloudflare Tunnel).
+
+### Changed
+- Renamed the Python package and CLI from ApplyPilot / `applypilot` to **Job Runner** / `job_runner`; user data directory default is now `~/.job_runner`, environment variables use the `JOB_RUNNER_` prefix, and the SQLite file is `job_runner.db`. Copy or rename old `~/.applypilot` data if migrating.
+
 ## [0.2.0] - 2026-02-17
 
 ### Added
-- **Parallel workers for discovery/enrichment** - `applypilot run --workers N` enables
+- **Parallel workers for discovery/enrichment** - `job_runner run --workers N` enables
   ThreadPoolExecutor-based parallelism for Workday scraping, smart extract, and detail
   enrichment. Default is sequential (1); power users can scale up.
 - **Apply utility modes** - `--gen` (generate prompt for manual debugging), `--mark-applied`,
-  `--mark-failed`, `--reset-failed` flags on `applypilot apply`
-- **Dry-run mode** - `applypilot apply --dry-run` fills forms without clicking Submit
+  `--mark-failed`, `--reset-failed` flags on `job_runner apply`
+- **Dry-run mode** - `job_runner apply --dry-run` fills forms without clicking Submit
 - **5 new tracking columns** - `agent_id`, `last_attempted_at`, `apply_duration_ms`,
   `apply_task_id`, `verification_confidence` for better apply-stage observability
 - **Manual ATS detection** - `manual_ats` list in `config/sites.yaml` skips sites with
@@ -24,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Config YAML not found after install** - moved `config/` into the package at
-  `src/applypilot/config/` so YAML files (employers, sites, searches) ship with `pip install`
+  `src/job_runner/config/` so YAML files (employers, sites, searches) ship with `pip install`
 - **Search config format mismatch** - wizard wrote `searches:` key but discovery code
   expected `queries:` with tier support. Aligned wizard output and example config
 - **JobSpy install isolation** - removed python-jobspy from package dependencies due to
@@ -59,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resume tailoring with factual preservation (no fabrication)
 - Cover letter generation per job
 - Autonomous browser-based application submission via Playwright
-- Interactive setup wizard (`applypilot init`)
+- Interactive setup wizard (`job_runner init`)
 - Cross-platform Chrome/Chromium detection (Windows, macOS, Linux)
 - Multi-provider LLM support (Gemini, OpenAI, local models via OpenAI-compatible endpoints)
 - Pipeline stats and HTML results dashboard

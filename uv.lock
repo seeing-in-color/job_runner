@@ -45,7 +45,7 @@ wheels = [
 ]
 
 [[package]]
-name = "applypilot"
+name = "job_runner"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
