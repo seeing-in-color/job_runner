@@ -353,6 +353,47 @@ class Daemon:
         self.offset_file.parent.mkdir(parents=True, exist_ok=True)
         self.offset_file.write_text(str(value), encoding="utf-8")
 
+    def _git_pull(self) -> tuple[bool, str]:
+        """Run ``git pull`` in ``repo_root``. Returns (success, output for Telegram)."""
+        branch = os.environ.get("JOB_RUNNER_GIT_BRANCH", "main").strip() or "main"
+        try:
+            r = subprocess.run(
+                ["git", "pull", "origin", branch],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=os.environ.copy(),
+            )
+            out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip() or "(no git output)"
+            return r.returncode == 0, out
+        except FileNotFoundError:
+            return False, "git not found on PATH. Install Git for Windows."
+        except Exception as e:
+            return False, str(e)
+
+    def _maybe_pip_install_editable(self) -> tuple[bool, str]:
+        """Optional ``pip install -e .`` after pull (set JOB_RUNNER_TELEGRAM_UPDATE_PIP=1)."""
+        if os.environ.get("JOB_RUNNER_TELEGRAM_UPDATE_PIP", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return True, ""
+        try:
+            r = subprocess.run(
+                [str(self.python_exe), "-m", "pip", "install", "-e", "."],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=os.environ.copy(),
+            )
+            out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+            return r.returncode == 0, out or "(pip finished)"
+        except Exception as e:
+            return False, str(e)
+
     def _status_text(self) -> str:
         ui_alive = bool((self.ui_proc and self.ui_proc.poll() is None) or self._is_tcp_open(self.ui_host, self.ui_port))
         ui = "running" if ui_alive else "stopped"
@@ -418,6 +459,7 @@ class Daemon:
             self.tg_send(
                 "Commands:\n"
                 "/status\n/start\n/stop\n/restart_ui\n/restart_tunnel\n/restart_all\n/reload_env\n/reboot\n"
+                "/update\n/git_pull\n"
                 "/remote\n/remote_status\n/remote_stop\n/clip <text>\n\n"
                 "Clipboard from Telegram:\n"
                 "- Send plain text message -> copy text to Windows clipboard\n"
@@ -455,6 +497,29 @@ class Daemon:
         if cmd in ("/reload_env", "reload_env"):
             self.reload_env()
             self.tg_send("Reloaded ~/.job_runner/.env")
+            return
+        if cmd in ("/update", "update", "/git_pull", "git_pull"):
+            self.tg_send("Running git pull…")
+            ok, out = self._git_pull()
+            if not ok:
+                summary = f"git pull failed (exit non-zero). Output:\n\n{out}"
+                if len(summary) > 4000:
+                    summary = summary[:3990] + "\n…(truncated)"
+                self.tg_send(summary)
+                return
+            pip_ok, pip_out = self._maybe_pip_install_editable()
+            if not pip_ok:
+                self.tg_send(f"pip install -e . failed:\n{pip_out[:3500]}")
+                return
+            self.reload_env()
+            self.restart_ui()
+            summary = f"git pull OK:\n\n{out}"
+            if pip_out:
+                summary += f"\n\npip:\n{pip_out}"
+            if len(summary) > 3800:
+                summary = summary[:3790] + "\n…(truncated)"
+            self.tg_send(summary)
+            self.tg_send("Restarted Job Runner UI — new code is live.")
             return
         if cmd in ("/reboot", "reboot"):
             self.tg_send("Rebooting host in 5 seconds.")
