@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import typer
@@ -404,11 +405,38 @@ def apply(
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    vision_stuck_nudge: str = typer.Option(
+        "auto",
+        "--vision-stuck-nudge",
+        help="When stuck: send screenshot to LLM (auto|on|off). auto=env default; off=text-only for DeepSeek.",
+    ),
+    chrome_seed_profile_dir: Optional[str] = typer.Option(
+        None,
+        "--chrome-seed-profile-dir",
+        help="Seed worker Chrome from this profile directory (e.g. 'Profile 1', 'Default') "
+        "inside your local Chrome user-data folder.",
+    ),
+    chrome_seed_user_data_dir: Optional[str] = typer.Option(
+        None,
+        "--chrome-seed-user-data-dir",
+        help="Override source Chrome user-data dir for seeding (advanced).",
+    ),
+    chrome_reseed: bool = typer.Option(
+        False,
+        "--chrome-reseed",
+        help="Rebuild worker Chrome profile from the selected seed profile before running apply.",
+    ),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
 
-    from job_runner.config import check_tier, get_apply_agent_provider, PROFILE_PATH as _profile_path
+    from job_runner.config import (
+        check_tier,
+        get_apply_agent_provider,
+        PROFILE_PATH,
+        PROJECT_PROFILE_PATH,
+        ensure_profile_stub_for_apply,
+    )
     from job_runner.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
@@ -436,24 +464,35 @@ def apply(
     # Check 1: Tier 3 required (Claude Code CLI + Chrome)
     check_tier(3, "auto-apply")
 
-    # Check 2: Profile exists
-    if not _profile_path.exists():
+    # Check 2: Profile exists (./profile.json or APP_DIR/profile.json), or seed starter from bundled example
+    if not PROJECT_PROFILE_PATH.exists() and not PROFILE_PATH.exists():
+        created = ensure_profile_stub_for_apply()
+        if created:
+            console.print(
+                "[yellow]Created starter profile[/yellow] at [bold]"
+                + str(created)
+                + "[/bold] (bundled [bold]profile.example.json[/bold]).\n"
+                "[bold]Edit name, email, phone, compensation, and work authorization before real submissions.[/bold]\n"
+            )
+    if not PROJECT_PROFILE_PATH.exists() and not PROFILE_PATH.exists():
         console.print(
             "[red]Profile not found.[/red]\n"
-            "Run [bold]job_runner init[/bold] to create your profile first."
+            "Run [bold]job_runner init[/bold] to create your profile, or fix permissions on "
+            f"[bold]{PROFILE_PATH}[/bold]."
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    # Check 3: At least one job can be applied (résumé from Find jobs / role_resumes or resume.pdf)
     if not (gen and url):
-        conn = get_connection()
-        ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
-        ).fetchone()[0]
+        from job_runner.apply.resume_source import count_jobs_ready_for_apply, sync_apply_ready_flags
+
+        sync_apply_ready_flags(min_score=min_score)
+        ready = count_jobs_ready_for_apply(min_score=min_score)
         if ready == 0:
             console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]job_runner run score tailor[/bold] first to prepare applications."
+                "[red]No jobs ready to apply.[/red]\n"
+                "Need scored jobs (fit ≥ min-score) with a PDF path: upload a .pdf in [bold]Find jobs[/bold] "
+                "for each discovery keyword, and/or place [bold]resume.pdf[/bold] in your data directory."
             )
             raise typer.Exit(code=1)
 
@@ -469,7 +508,7 @@ def apply(
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
-        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
+        mcp_path = PROFILE_PATH.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         console.print(f"\n[bold]Run manually (Claude Code + MCP):[/bold]")
         console.print(
@@ -478,6 +517,26 @@ def apply(
             f"--permission-mode bypassPermissions < {prompt_file}"
         )
         return
+
+    vn = (vision_stuck_nudge or "auto").strip().lower()
+    if vn in ("on", "1", "true", "yes"):
+        os.environ["JOB_RUNNER_APPLY_VISION_STUCK_NUDGE"] = "1"
+    elif vn in ("off", "0", "false", "no"):
+        os.environ["JOB_RUNNER_APPLY_VISION_STUCK_NUDGE"] = "0"
+    elif vn in ("auto", ""):
+        os.environ["JOB_RUNNER_APPLY_VISION_STUCK_NUDGE"] = "auto"
+    else:
+        console.print("[red]--vision-stuck-nudge must be auto, on, or off[/red]")
+        raise typer.Exit(code=1)
+
+    if chrome_seed_profile_dir and chrome_seed_profile_dir.strip():
+        os.environ["JOB_RUNNER_CHROME_SEED_PROFILE_DIR"] = chrome_seed_profile_dir.strip()
+    if chrome_seed_user_data_dir and chrome_seed_user_data_dir.strip():
+        os.environ["JOB_RUNNER_CHROME_SEED_USER_DATA_DIR"] = chrome_seed_user_data_dir.strip()
+    if chrome_reseed:
+        os.environ["JOB_RUNNER_CHROME_RESEED"] = "1"
+
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
     from job_runner.apply.launcher import main as apply_main
 
@@ -496,6 +555,11 @@ def apply(
     console.print(f"  Model:    {resolved_model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
+    console.print(f"  Vision:   {vn} (stuck screenshot nudge)")
+    if chrome_seed_profile_dir:
+        console.print(f"  Chrome profile seed: {chrome_seed_profile_dir.strip()}")
+    if chrome_reseed:
+        console.print("  Chrome reseed: on")
     if url:
         console.print(f"  Target:   {url}")
     console.print()
@@ -643,8 +707,14 @@ def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from job_runner.config import (
-        load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        load_env,
+        PROFILE_PATH,
+        PROJECT_PROFILE_PATH,
+        RESUME_PATH,
+        RESUME_PDF_PATH,
+        SEARCH_CONFIG_PATH,
+        ENV_PATH,
+        get_chrome_path,
     )
 
     load_env()
@@ -656,11 +726,13 @@ def doctor() -> None:
     results: list[tuple[str, str, str]] = []  # (check, status, note)
 
     # --- Tier 1 checks ---
-    # Profile
-    if PROFILE_PATH.exists():
+    # Profile (same resolution order as load_profile)
+    if PROJECT_PROFILE_PATH.exists():
+        results.append(("profile.json", ok_mark, str(PROJECT_PROFILE_PATH)))
+    elif PROFILE_PATH.exists():
         results.append(("profile.json", ok_mark, str(PROFILE_PATH)))
     else:
-        results.append(("profile.json", fail_mark, "Run 'job_runner init' to create"))
+        results.append(("profile.json", fail_mark, "Run 'job_runner init' or apply once to seed profile"))
 
     # Resume
     if RESUME_PATH.exists():
@@ -698,8 +770,12 @@ def doctor() -> None:
     import os
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    has_deepseek = bool(os.environ.get("DEEPSEEK_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_openai:
+    if has_deepseek:
+        model = os.environ.get("LLM_MODEL", "deepseek-chat")
+        results.append(("LLM API key", ok_mark, f"DeepSeek ({model})"))
+    elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
     elif has_gemini:
@@ -709,7 +785,7 @@ def doctor() -> None:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
-                        "Set OPENAI_API_KEY or GEMINI_API_KEY in ~/.job_runner/.env (run 'job_runner init')"))
+                        "Set DEEPSEEK_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY in ~/.job_runner/.env (run 'job_runner init')"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI

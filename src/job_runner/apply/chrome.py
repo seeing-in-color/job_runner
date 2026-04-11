@@ -6,11 +6,15 @@ worker profile setup/cloning, and cross-platform process cleanup.
 
 import json
 import logging
+import os
 import platform
+import socket
 import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from job_runner import config
@@ -93,9 +97,66 @@ def _kill_on_port(port: int) -> None:
         logger.debug("Failed to kill process on port %d", port, exc_info=True)
 
 
+def _cdp_endpoint_ready(port: int) -> bool:
+    """True when Chrome DevTools endpoint is up and reports websocket URL."""
+    url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as resp:  # nosec B310 - localhost only
+            if resp.status != 200:
+                return False
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore") or "{}")
+            return bool(payload.get("webSocketDebuggerUrl"))
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _wait_for_cdp_ready(proc: subprocess.Popen, port: int, timeout_sec: float = 25.0) -> None:
+    """Block until CDP is reachable or Chrome exits/times out."""
+    deadline = time.time() + max(1.0, timeout_sec)
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Chrome exited before CDP ready (port {port}, code {proc.returncode})")
+        if _cdp_endpoint_ready(port):
+            return
+        time.sleep(0.25)
+    raise RuntimeError(f"Chrome CDP endpoint not ready on port {port} after {timeout_sec:.0f}s")
+
+
 # ---------------------------------------------------------------------------
 # Worker profile management
 # ---------------------------------------------------------------------------
+
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on"))
+
+
+def _seed_marker_path(profile_dir: Path) -> Path:
+    return profile_dir / ".seed_profile.json"
+
+
+def _load_seed_marker(profile_dir: Path) -> dict | None:
+    p = _seed_marker_path(profile_dir)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_seed_marker(profile_dir: Path, marker: dict | None) -> None:
+    p = _seed_marker_path(profile_dir)
+    if not marker:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+    try:
+        p.write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
 
 def setup_worker_profile(worker_id: int) -> Path:
     """Create an isolated Chrome profile for a worker.
@@ -119,26 +180,41 @@ def setup_worker_profile(worker_id: int) -> Path:
         Path to the worker's Chrome user-data directory.
     """
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+    seed_user_data_raw = os.environ.get("JOB_RUNNER_CHROME_SEED_USER_DATA_DIR", "").strip()
+    seed_profile_dir = os.environ.get("JOB_RUNNER_CHROME_SEED_PROFILE_DIR", "").strip()
+    force_reseed = _env_truthy("JOB_RUNNER_CHROME_RESEED")
+
+    requested_marker: dict | None = None
+    if seed_profile_dir:
+        requested_marker = {
+            "seed_user_data_dir": seed_user_data_raw or "<default-user-data>",
+            "seed_profile_dir": seed_profile_dir,
+        }
+
     if (profile_dir / "Default").exists():
-        return profile_dir  # Already initialized
+        existing_marker = _load_seed_marker(profile_dir)
+        if requested_marker and not force_reseed:
+            if existing_marker == requested_marker:
+                return profile_dir  # Already initialized with this requested seed profile
+        elif not requested_marker and not force_reseed:
+            return profile_dir  # Already initialized and no explicit reseed requested
+        # Reseed requested (or seed profile changed): rebuild worker profile.
+        shutil.rmtree(str(profile_dir), ignore_errors=True)
 
     # Find a source: prefer existing worker (has session cookies), else user profile
     source: Path | None = None
-    for wid in range(10):
-        if wid == worker_id:
-            continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
-            source = candidate
-            break
+    if not seed_profile_dir:
+        for wid in range(10):
+            if wid == worker_id:
+                continue
+            candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
+            if (candidate / "Default").exists():
+                source = candidate
+                break
     if source is None:
-        import os
-        seed_user_data = os.environ.get("JOB_RUNNER_CHROME_SEED_USER_DATA_DIR", "").strip()
-        source = Path(seed_user_data).expanduser() if seed_user_data else config.get_chrome_user_data()
+        source = Path(seed_user_data_raw).expanduser() if seed_user_data_raw else config.get_chrome_user_data()
 
     # Optional: seed from a specific Chrome profile dir (copy it as Default).
-    import os
-    seed_profile_dir = os.environ.get("JOB_RUNNER_CHROME_SEED_PROFILE_DIR", "").strip()
     if seed_profile_dir and source and (source / seed_profile_dir).exists():
         logger.info(
             "[worker-%d] Seeding Chrome profile from %s/%s (first time setup)...",
@@ -158,6 +234,7 @@ def setup_worker_profile(worker_id: int) -> Path:
             # Copy Local State when present (some profile metadata lives there).
             if (source / "Local State").exists():
                 shutil.copy2(str(source / "Local State"), str(profile_dir / "Local State"))
+            _write_seed_marker(profile_dir, requested_marker)
             return profile_dir
         except Exception:
             # Fall back to the broader copy approach below.
@@ -193,6 +270,7 @@ def setup_worker_profile(worker_id: int) -> Path:
         except (PermissionError, OSError):
             pass  # skip locked files
 
+    _write_seed_marker(profile_dir, requested_marker)
     return profile_dir
 
 
@@ -251,6 +329,10 @@ def launch_chrome(worker_id: int, port: int | None = None,
     import os
     profile_subdir = os.environ.get("JOB_RUNNER_CHROME_PROFILE_DIR", "").strip() or "Default"
 
+    win_size = os.environ.get("JOB_RUNNER_CHROME_WINDOW_SIZE", "1280,840").strip()
+    if not win_size or "," not in win_size:
+        win_size = "1280,840"
+
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
@@ -258,7 +340,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         f"--profile-directory={profile_subdir}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--window-size=1024,768",
+        f"--window-size={win_size}",
         "--disable-session-crashed-bubble",
         "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
         "--hide-crash-restore-bubble",
@@ -275,8 +357,10 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if headless:
         cmd.append("--headless=new")
     else:
-        # Keep headed runs fullscreen for easier visual monitoring/debugging.
-        cmd.extend(["--start-maximized", "--start-fullscreen"])
+        # Windowed (not maximized/fullscreen) so you can see the desktop and other windows.
+        pos = os.environ.get("JOB_RUNNER_CHROME_WINDOW_POSITION", "80,40").strip()
+        if pos and "," in pos:
+            cmd.append(f"--window-position={pos}")
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -288,8 +372,15 @@ def launch_chrome(worker_id: int, port: int | None = None,
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
+    # Wait for DevTools endpoint instead of a fixed sleep (avoids connect loops on slower starts).
+    try:
+        _wait_for_cdp_ready(proc, port, timeout_sec=25.0)
+    except Exception:
+        _kill_process_tree(proc.pid)
+        with _chrome_lock:
+            _chrome_procs.pop(worker_id, None)
+        raise
+
     logger.info("[worker-%d] Chrome started on port %d (pid %d)",
                 worker_id, port, proc.pid)
     return proc

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import csv
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from job_runner.config import (
     ROLE_RESUMES_DIR,
     SEARCH_CONFIG_PATH,
     ensure_dirs,
+    get_chrome_user_data,
     get_tier,
     load_env,
     load_search_config,
@@ -51,6 +53,7 @@ from job_runner.job_interests import (
     keyword_interest_id,
     keywords_from_searches_dict,
     load_job_interests,
+    match_interest_for_search_query,
     safe_role_resume_path,
     save_job_interests,
     sync_job_interests_to_searches,
@@ -63,7 +66,6 @@ from job_runner.scoring.criteria import (
 )
 from job_runner.scoring.role_resume import uses_role_upload_for_scoring
 from job_runner.discovery.jobspy import PYTHON_JOBSPY_PIP_SPEC
-from job_runner.scoring.scorer import parse_criteria_table_rows, parse_stored_score_reasoning
 from job_runner.webui.find_jobs_config import (
     MAX_DISCOVER_PARALLEL,
     apply_find_jobs_form_to_cfg,
@@ -245,9 +247,23 @@ def _canonical_application_track(raw: str | None) -> str:
 
 
 def _job_public_dict(row: Any, *, ji: Any | None = None) -> dict[str, Any]:
+    # Lazy-import scorer helpers so importing this module does not load ~1.6k lines of scorer + LLM stack
+    # (keeps `job_runner ui` / create_app startup fast and avoids long "stuck" cold imports).
+    from job_runner.scoring.scorer import parse_criteria_table_rows, parse_stored_score_reasoning
+
     d = {k: row[k] for k in row.keys()}
     d["application_track"] = _canonical_application_track(d.get("application_track"))
     d["has_role_resume_for_query"] = uses_role_upload_for_scoring(d, ji=ji)
+    linked_resume = ""
+    eff_ji = ji if ji is not None else get_effective_job_interests()
+    matched = match_interest_for_search_query(
+        str(d.get("search_query") or ""),
+        eff_ji.interests,
+    )
+    if matched and (matched.resume_filename or "").strip():
+        linked_resume = matched.resume_filename.strip()
+    d["linked_role_resume_filename"] = linked_resume
+    d["linked_role_resume_exists"] = bool(linked_resume and safe_role_resume_path(linked_resume))
     sr = d.get("score_reasoning") or ""
     parsed = parse_stored_score_reasoning(str(sr))
     d["keywords_line"] = parsed.get("keywords") or ""
@@ -278,6 +294,56 @@ def meta() -> dict[str, Any]:
         "hostname": hostname,
         "role_resumes_dir": str(ROLE_RESUMES_DIR.resolve()),
         "trust_lan": trust_lan,
+    }
+
+
+@router.get("/chrome/profiles")
+def list_chrome_profiles(request: Request) -> dict[str, Any]:
+    """List available Chrome profile directories from local user-data."""
+    require_local(request)
+    base = get_chrome_user_data()
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    info_cache: dict[str, Any] = {}
+    local_state = base / "Local State"
+    if local_state.is_file():
+        try:
+            raw = json.loads(local_state.read_text(encoding="utf-8"))
+            info_cache = ((raw.get("profile") or {}).get("info_cache") or {})
+            if not isinstance(info_cache, dict):
+                info_cache = {}
+        except (OSError, ValueError, json.JSONDecodeError):
+            info_cache = {}
+
+    if base.is_dir():
+        for p in sorted(base.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_dir():
+                continue
+            d = p.name.strip()
+            if d == "Default" or d.startswith("Profile "):
+                if d in seen:
+                    continue
+                seen.add(d)
+                label = str((info_cache.get(d) or {}).get("name") or d).strip() or d
+                out.append({"dir": d, "label": label})
+
+    # Ensure profiles that only exist in Local State are still exposed.
+    for d, meta in info_cache.items():
+        if not isinstance(d, str):
+            continue
+        if not (d == "Default" or d.startswith("Profile ")):
+            continue
+        if d in seen:
+            continue
+        seen.add(d)
+        label = str((meta or {}).get("name") or d).strip() or d
+        out.append({"dir": d, "label": label})
+
+    out.sort(key=lambda x: (0 if x["dir"] == "Default" else 1, x["dir"].lower()))
+    return {
+        "base_dir": str(base),
+        "profiles": out,
     }
 
 
@@ -338,6 +404,42 @@ def list_jobs(
 ) -> dict[str, Any]:
     init_db()
     conn = get_connection()
+    where, params = _jobs_filters_where_params(
+        q=q,
+        site=site,
+        min_score=min_score,
+        max_score=max_score,
+        scored_only=scored_only,
+        application_track=application_track,
+    )
+    order_sql = _JOBS_ORDER_BY.get(sort, _JOBS_ORDER_BY["score_desc"])
+    sql_where = " AND ".join(where)
+    total = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {sql_where}", params).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT * FROM jobs WHERE {sql_where} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+        [*params, limit, offset],
+    ).fetchall()
+    ji = get_effective_job_interests()
+    jobs = [_job_public_dict(r, ji=ji) for r in rows]
+    loaded = offset + len(jobs)
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "jobs": jobs,
+        "has_more": loaded < total,
+    }
+
+
+def _jobs_filters_where_params(
+    *,
+    q: str | None,
+    site: str | None,
+    min_score: int | None,
+    max_score: int | None,
+    scored_only: bool,
+    application_track: str | None,
+) -> tuple[list[str], list[Any]]:
     where: list[str] = ["1=1"]
     params: list[Any] = []
 
@@ -367,24 +469,72 @@ def list_jobs(
                 400,
                 "Invalid application_track filter (use open, applied, follow_up, interview, or unset)",
             )
+    return where, params
 
+
+@router.get("/jobs/export.csv")
+def export_jobs_csv(
+    q: str | None = None,
+    site: str | None = None,
+    min_score: int | None = None,
+    max_score: int | None = None,
+    scored_only: bool = False,
+    application_track: str | None = Query(
+        None,
+        description="Filter: open | applied | follow_up | interview | unset",
+    ),
+    sort: str = Query(
+        "score_desc",
+        description="score_desc | score_asc | title_asc | title_desc | site_asc | site_desc | discovered_desc | discovered_asc | track_asc | track_desc",
+    ),
+) -> StreamingResponse:
+    init_db()
+    conn = get_connection()
+    where, params = _jobs_filters_where_params(
+        q=q,
+        site=site,
+        min_score=min_score,
+        max_score=max_score,
+        scored_only=scored_only,
+        application_track=application_track,
+    )
     order_sql = _JOBS_ORDER_BY.get(sort, _JOBS_ORDER_BY["score_desc"])
     sql_where = " AND ".join(where)
-    total = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {sql_where}", params).fetchone()[0]
     rows = conn.execute(
-        f"SELECT * FROM jobs WHERE {sql_where} ORDER BY {order_sql} LIMIT ? OFFSET ?",
-        [*params, limit, offset],
+        f"SELECT * FROM jobs WHERE {sql_where} ORDER BY {order_sql}",
+        params,
     ).fetchall()
+
     ji = get_effective_job_interests()
     jobs = [_job_public_dict(r, ji=ji) for r in rows]
-    loaded = offset + len(jobs)
-    return {
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "jobs": jobs,
-        "has_more": loaded < total,
-    }
+
+    out = io.StringIO()
+    cols = [
+        "title",
+        "site",
+        "fit_score",
+        "search_query",
+        "application_track",
+        "url",
+        "application_url",
+        "direct_application_url",
+        "linked_role_resume_filename",
+        "apply_ready",
+        "apply_status",
+        "apply_attempts",
+        "applied_at",
+        "discovered_at",
+    ]
+    writer = csv.DictWriter(out, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(jobs)
+    data = out.getvalue().encode("utf-8")
+    out.close()
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="job_runner_results.csv"'},
+    )
 
 
 class TrackBody(BaseModel):
@@ -644,19 +794,19 @@ async def post_interest_upload_all(request: Request, file: UploadFile = File(...
 
 class LinkResumeBody(BaseModel):
     search_query: str = Field(..., min_length=1, max_length=800)
-    resume_filename: str = Field(..., min_length=1, max_length=260)
+    resume_filename: str | None = Field(None, max_length=260)
 
 
 @router.post("/interests/link")
 def post_interest_link_resume(request: Request, body: LinkResumeBody) -> dict[str, Any]:
-    """Attach an existing file under ``role_resumes/`` to a discovery keyword (``search_query``)."""
+    """Attach (or clear) a file under ``role_resumes/`` for a discovery keyword."""
     require_local(request)
     sq = body.search_query.strip()
     if not sq:
         raise HTTPException(400, "search_query is empty")
-    fn = body.resume_filename.strip()
-    if not fn or not safe_role_resume_path(fn):
-        raise HTTPException(400, "Invalid or missing résumé file (must exist under role_resumes/)")
+    fn = (body.resume_filename or "").strip() or None
+    if fn and not safe_role_resume_path(fn):
+        raise HTTPException(400, "Invalid résumé file (must exist under role_resumes/)")
     ensure_search_keyword_in_searches(sq)
     sync_job_interests_to_searches()
     ji = get_effective_job_interests()
@@ -673,7 +823,7 @@ def post_interest_link_resume(request: Request, body: LinkResumeBody) -> dict[st
         )
     target.resume_filename = fn
     save_job_interests(ji)
-    return {"ok": True, "filename": fn, "interest_id": target.id}
+    return {"ok": True, "filename": fn or "", "interest_id": target.id}
 
 
 @router.get("/role-resumes")
@@ -859,7 +1009,7 @@ class PipelineBody(BaseModel):
     chunk_size: int | None = Field(25, ge=1, le=500)
     chunk_delay: float | None = Field(5.0, ge=0.0, le=120.0)
     score_verbose: bool = False
-    score_provider: str | None = Field(None, description="openai | gemini | anthropic")
+    score_provider: str | None = Field(None, description="openai | deepseek | gemini | anthropic")
     score_model: str | None = Field(None, description="Model id used by score/tailor/cover stages")
 
 
@@ -871,6 +1021,22 @@ class ApplyBody(BaseModel):
     min_score: int = Field(7, ge=1, le=10)
     dry_run: bool = False
     headless: bool = False
+    vision_stuck_nudge: str = Field(
+        "auto",
+        description="When stuck: auto | on | off (screenshot to LLM). Matches JOB_RUNNER_APPLY_VISION_STUCK_NUDGE.",
+    )
+    chrome_seed_profile_dir: str | None = Field(
+        None,
+        description="Chrome profile dir to seed from local user-data (e.g. 'Profile 1').",
+    )
+    chrome_seed_user_data_dir: str | None = Field(
+        None,
+        description="Optional absolute user-data directory used as seed source.",
+    )
+    chrome_reseed: bool = Field(
+        False,
+        description="Rebuild worker Chrome profile from seed before run.",
+    )
 
 
 @router.post("/pipeline/run")

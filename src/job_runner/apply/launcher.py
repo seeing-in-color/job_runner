@@ -24,8 +24,9 @@ from rich.console import Console
 from rich.live import Live
 
 from job_runner import config
-from job_runner.database import get_connection
+from job_runner.database import ensure_columns, get_connection
 from job_runner.apply import chrome, dashboard, prompt as prompt_mod
+from job_runner.apply.url_resolver import resolve_best_apply_url
 from job_runner.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -98,63 +99,104 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
     Returns:
         Job dict or None if the queue is empty.
+
+    Queue jobs must have ``apply_ready = 1`` (see ``sync_apply_ready_flags``), except when
+    ``target_url`` is set (manual / debug: any matching job may be acquired).
     """
+    from job_runner.apply.resume_source import job_ready_for_apply
+
     conn = get_connection()
+    ensure_columns(conn)
     try:
         conn.execute("BEGIN IMMEDIATE")
 
-        if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status != 'in_progress')
-                LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
-        else:
-            blocked_sites, blocked_patterns = _load_blocked()
-            # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
-            site_clause = ""
-            if blocked_sites:
-                placeholders = ",".join("?" * len(blocked_sites))
-                site_clause = f"AND site NOT IN ({placeholders})"
-                params.extend(blocked_sites)
-            url_clauses = ""
-            if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
+        blocked_sites, blocked_patterns = _load_blocked()
+        params: list = [config.get_max_apply_attempts(), min_score]
+        site_clause = ""
+        if blocked_sites:
+            placeholders = ",".join("?" * len(blocked_sites))
+            site_clause = f"AND site NOT IN ({placeholders})"
+            params.extend(blocked_sites)
+        url_clauses = ""
+        if blocked_patterns:
+            url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
+            params.extend(blocked_patterns)
+
+        ready_clause = "" if target_url else "AND apply_ready = 1"
+
+        core_where = f"""
+                WHERE (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
+                  {ready_clause}
                   {site_clause}
                   {url_clauses}
+            """
+        select_cols = """
+                SELECT url, title, site, application_url, direct_application_url, tailored_resume_path,
+                       fit_score, location, full_description, cover_letter_path, search_query
+                FROM jobs
+            """
+
+        if target_url:
+            like = f"%{target_url.split('?')[0].rstrip('/')}%"
+            rows = conn.execute(
+                select_cols
+                + core_where
+                + """
+                  AND (
+                    url = ? OR application_url = ? OR direct_application_url = ?
+                    OR application_url LIKE ? OR direct_application_url LIKE ? OR url LIKE ?
+                  )
                 ORDER BY fit_score DESC, url
-                LIMIT 1
-            """, [config.get_max_apply_attempts()] + params).fetchone()
+                LIMIT 80
+                """,
+                params + [target_url, target_url, target_url, like, like, like],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                select_cols + core_where + """
+                ORDER BY fit_score DESC, url
+                LIMIT 80
+                """,
+                params,
+            ).fetchall()
+
+        from job_runner.config import is_manual_ats
+
+        row = None
+        selected_job: dict | None = None
+        for candidate in rows:
+            job = dict(candidate)
+            if not job_ready_for_apply(job):
+                continue
+            apply_url, inferred_direct = resolve_best_apply_url(job)
+            if inferred_direct and not (job.get("direct_application_url") or "").strip():
+                job["direct_application_url"] = inferred_direct
+            if is_manual_ats(apply_url):
+                conn.execute(
+                    "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                    (job["url"],),
+                )
+                continue
+            if inferred_direct and not (dict(candidate).get("direct_application_url") or "").strip():
+                conn.execute(
+                    "UPDATE jobs SET direct_application_url = ? WHERE url = ?",
+                    (inferred_direct, job["url"]),
+                )
+            row = candidate
+            selected_job = job
+            break
 
         if not row:
             conn.rollback()
-            return None
-
-        # Skip manual ATS sites (unsolvable CAPTCHAs)
-        from job_runner.config import is_manual_ats
-        apply_url = row["application_url"] or row["url"]
-        if is_manual_ats(apply_url):
-            conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                (row["url"],),
-            )
-            conn.commit()
-            logger.info("Skipping manual ATS: %s", row["url"][:80])
+            if rows:
+                logger.warning(
+                    "apply: %d job(s) match score/filters but none could be started — "
+                    "need a résumé PDF (Find jobs upload per keyword or resume.pdf), "
+                    "and not manual-only ATS. Open logs for details.",
+                    len(rows),
+                )
             return None
 
         now = datetime.now(timezone.utc).isoformat()
@@ -166,7 +208,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         """, (f"worker-{worker_id}", now, row["url"]))
         conn.commit()
 
-        return dict(row)
+        return selected_job or dict(row)
     except Exception:
         conn.rollback()
         raise
@@ -183,7 +225,8 @@ def mark_result(url: str, status: str, error: str | None = None,
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            application_track = 'applied',
                            apply_error = NULL, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           apply_ready = 0
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
     else:
@@ -222,14 +265,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if not job:
         return None
 
-    # Read resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
-
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    prompt = prompt_mod.build_prompt(job=job, cover_letter=None, dry_run=False)
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -261,7 +297,8 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
+                           apply_error = NULL, agent_id = NULL,
+                           apply_ready = 0
             WHERE url = ?
         """, (now, url))
     else:
@@ -288,7 +325,14 @@ def reset_failed() -> int:
               AND apply_status != 'in_progress')
     """)
     conn.commit()
-    return cursor.rowcount
+    n = cursor.rowcount
+    try:
+        from job_runner.apply.resume_source import sync_apply_ready_flags
+
+        sync_apply_ready_flags()
+    except Exception:
+        logger.exception("sync_apply_ready_flags after reset_failed")
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -314,17 +358,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             mo = config.get_apply_openai_model()
         return run_job_openai(job, port, worker_id, model=mo, dry_run=dry_run)
 
-    # Read tailored resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
-
-    # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
         job=job,
-        tailored_resume=resume_text,
+        cover_letter=None,
         dry_run=dry_run,
     )
 
@@ -370,7 +406,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     log_header = (
         f"\n{'=' * 60}\n"
         f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
-        f"URL: {job.get('application_url') or job['url']}\n"
+        f"URL: {job.get('direct_application_url') or job.get('application_url') or job['url']}\n"
         f"Score: {job.get('fit_score', 'N/A')}/10\n"
         f"{'=' * 60}\n"
     )
@@ -583,6 +619,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
 
+    try:
+        from job_runner.apply.resume_source import sync_apply_ready_flags
+
+        sync_apply_ready_flags()
+    except Exception:
+        logger.exception("sync_apply_ready_flags at worker start")
+
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
             break
@@ -594,6 +637,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                           worker_id=worker_id)
         if not job:
             if not continuous:
+                msg = (
+                    f"Apply: no job to run (min score {min_score}). "
+                    "Either the queue is empty, or jobs lack a résumé PDF path — "
+                    "upload PDFs in Find jobs per keyword and/or add resume.pdf under app data."
+                )
+                logger.warning(msg)
+                print(msg, flush=True)
                 add_event(f"[W{worker_id}] Queue empty")
                 update_state(worker_id, status="done", last_action="queue empty")
                 break
@@ -693,6 +743,15 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+    # Plain print so terminal users see output before Rich Live attaches (avoids “nothing happens”).
+    print("job_runner: starting apply pipeline…", flush=True)
 
     if continuous:
         effective_limit = 0

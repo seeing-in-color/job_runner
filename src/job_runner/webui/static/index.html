@@ -44,7 +44,11 @@
 
         <section id="section-dashboard" class="section active">
           <h2>Dashboard</h2>
-          <p class="lead">Pipeline snapshot from your local database. Run <strong>discover</strong> from <strong>Find jobs</strong> or score from your terminal.</p>
+          <p class="lead">
+            Pipeline snapshot from your local database. Run <strong>discover</strong> from <strong>Find jobs</strong>,
+            or <strong>Run score</strong> from <strong>Score</strong> (optionally with <strong>Rescore</strong> to test
+            again on existing rows).
+          </p>
           <div id="dash-stats" class="grid-stats"></div>
           <p class="status-bar" id="dash-status"></p>
         </section>
@@ -114,7 +118,8 @@
           <h2>Score</h2>
           <p class="lead">
             Criteria in <code>scoring_criteria.json</code>; role résumés apply per discovery keyword. Save, then
-            <strong>Run score</strong>.
+            <strong>Run score</strong>. Turn on <strong>Rescore</strong> below to run the LLM again on jobs that already
+            have scores (same as <code>job_runner run score --rescore</code>).
           </p>
           <div class="panel">
             <h3>Criteria</h3>
@@ -140,16 +145,27 @@
               >
             </div>
             <div class="form-row">
+              <label
+                ><input type="checkbox" id="score-rescore" />
+                Rescore — re-run LLM scoring for jobs that already have scores (uses API calls again)</label
+              >
+            </div>
+            <div class="form-row">
               <button type="button" class="btn" id="btn-save-criteria">Save</button>
               <label for="score-model-preset" title="Choose which AI brain to use for scoring.">
                 Score model
                 <select id="score-model-preset" class="results-inline-select">
-                  <option value="openai|deepseek-chat">DeepSeek Chat (~$0.0007/1K tok)</option>
+                  <option value="deepseek|deepseek-chat">DeepSeek Chat (~$0.0007/1K tok)</option>
                   <option value="openai|gpt-4o-mini">OpenAI GPT-4o mini (~$0.00075/1K tok)</option>
                   <option value="anthropic|claude-3-5-haiku-latest">Claude Haiku (~$0.0048/1K tok)</option>
                 </select>
               </label>
-              <button type="button" class="btn" id="btn-run-score" title="Save criteria, then run the score stage (same as job_runner run score)">
+              <button
+                type="button"
+                class="btn"
+                id="btn-run-score"
+                title="Save criteria, then run the score stage. Check Rescore above to include jobs already scored."
+              >
                 Run score
               </button>
               <span class="status-bar" id="score-status"></span>
@@ -211,11 +227,38 @@
                 <input type="number" id="apply-limit" class="results-inline-num" min="0" max="500" value="5" />
                 <label for="apply-workers">Workers</label>
                 <input type="number" id="apply-workers" class="results-inline-num" min="1" max="8" value="1" />
+                <label for="apply-chrome-profile" title="Use a specific Chrome account/profile for apply runs. Example: Profile 1">
+                  Chrome profile
+                </label>
+                <select
+                  id="apply-chrome-profile"
+                  class="results-inline-select"
+                  title="Auto-detected from your local Chrome profiles"
+                >
+                  <option value="">Auto (default)</option>
+                </select>
+                <label class="results-apply-vision-label" title="Re-copy selected Chrome profile into worker before run">
+                  <input type="checkbox" id="apply-chrome-reseed" />
+                  Reseed
+                </label>
+                <span
+                  class="results-apply-vision"
+                  title="When stuck: ON sends a screenshot to the LLM (needs a vision-capable API). OFF forces text-only recovery. Neither = default (auto from ~/.job_runner/.env)."
+                >
+                  <label class="results-apply-vision-label"
+                    ><input type="checkbox" id="apply-vision-on" /> Vision on</label
+                  >
+                  <label class="results-apply-vision-label"
+                    ><input type="checkbox" id="apply-vision-off" /> Vision off</label
+                  >
+                </span>
                 <button type="button" class="btn" id="btn-results-apply" title="Run browser auto-apply on unsubmitted jobs">
                   Apply
                 </button>
               </div>
               <button type="button" class="btn btn-ghost" id="btn-results-refresh">Refresh</button>
+              <button type="button" class="btn btn-ghost" id="btn-results-export-csv">Export CSV</button>
+              <!-- Tailor stage UI disabled; apply uses Find jobs role résumés + resume.pdf (see apply/resume_source.py). -->
               <details class="results-actions-menu" id="results-actions-menu">
                 <summary class="btn btn-ghost results-actions-summary">Delete…</summary>
                 <div class="results-actions-menu__panel" role="menu">
@@ -234,6 +277,7 @@
               <thead>
                 <tr>
                   <th>Title</th>
+                  <th>Links</th>
                   <th>Site</th>
                   <th class="results-th-score-wrap" scope="col" id="results-th-score-col" aria-sort="descending">
                     <button
@@ -256,6 +300,11 @@
           </div>
           <p class="status-bar" id="results-status"></p>
           <p class="status-bar" id="results-apply-cost"></p>
+          <p class="status-bar status-bar--hint" id="results-apply-hint">
+            Apply output and errors stream to the <strong>Terminal</strong> panel at the bottom of this page. If nothing
+            runs, you likely need a résumé PDF (Find jobs per keyword or <code>resume.pdf</code>) and scored jobs (fit ≥
+            min).
+          </p>
         </section>
 
         <section id="section-settings" class="section">

@@ -13,8 +13,27 @@ from pathlib import Path
 
 from job_runner import config
 from job_runner.apply.field_answers import format_rules_for_prompt
+from job_runner.apply.url_resolver import resolve_best_apply_url
 
 logger = logging.getLogger(__name__)
+
+# OpenAI compact apply: system message hint + full user block (see build_compact_apply_prompt).
+COMPACT_APPLY_SYSTEM_PHASES_ONE_LINE = (
+    "Follow phases: land → dismiss blockers → reach Apply/ATS → auth if needed → "
+    "browser_form_fields each step → paginate with Next/Continue → final Submit → confirm RESULT. "
+    "If form_fields is empty but the page has controls, use browser_clickables."
+)
+
+COMPACT_APPLY_PHASES_BLOCK = """== APPLY PHASES (follow in order) ==
+1) **Land:** You start at the job/application URL. Use browser_snapshot sparingly; dismiss cookie banners and modals that block clicks.
+2) **Reach the application:** Click the primary Apply / Easy Apply / apply on company site until the real ATS or form opens (browser_tabs if a new tab opened).
+3) **Authenticate:** If required, sign in or create an account with the credentials in RULES (not Google/Microsoft SSO).
+4) **Fill:** On each step, call browser_form_fields first; fill, upload, and select using the same frame_index as each row. Do not re-type values that already match the profile.
+5) **Multi-page:** Use Next / Continue / Save and continue until the final review step; only then Submit.
+6) **Confirm:** Check for success/thank-you text, then output exactly one RESULT: line.
+7) **Empty form_fields:** If inputs are not listed but you need to proceed, call browser_clickables to see visible links and buttons (with frame_index), then browser_click.
+
+"""
 
 
 def _build_profile_summary(profile: dict) -> str:
@@ -206,7 +225,6 @@ def _build_hard_rules(profile: dict) -> str:
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
@@ -427,7 +445,7 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
-def build_prompt(job: dict, tailored_resume: str,
+def build_prompt(job: dict,
                  cover_letter: str | None = None,
                  dry_run: bool = False) -> str:
     """Build the full instruction prompt for the apply agent.
@@ -437,28 +455,22 @@ def build_prompt(job: dict, tailored_resume: str,
 
     Args:
         job: Job dict from the database (must have url, title, site,
-             application_url, fit_score, tailored_resume_path).
-        tailored_resume: Plain-text content of the tailored resume.
+             application_url, fit_score; résumé from tailored output or Find jobs / ``resume.pdf``).
         cover_letter: Optional plain-text cover letter content.
         dry_run: If True, tell the agent not to click Submit.
 
     Returns:
         Complete prompt string for the AI agent.
     """
+    from job_runner.apply.resume_source import resolve_apply_resume_paths
+
     profile = config.load_profile()
     search_config = config.load_search_config()
     personal = profile["personal"]
     linkedin_email = str(personal.get("linkedin_email") or "").strip()
     linkedin_password = str(personal.get("linkedin_password") or "").strip()
 
-    # --- Resolve resume PDF path ---
-    resume_path = job.get("tailored_resume_path")
-    if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
-
-    src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
-    if not src_pdf.exists():
-        raise ValueError(f"Resume PDF not found: {src_pdf}")
+    tailored_resume, src_pdf = resolve_apply_resume_paths(job)
 
     # Copy to a clean filename for upload (recruiters see the filename)
     full_name = personal["full_name"]
@@ -525,7 +537,9 @@ def build_prompt(job: dict, tailored_resume: str,
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
-    job_url_raw = job.get("application_url") or job["url"] or ""
+    job_url_raw, inferred_direct = resolve_best_apply_url(job)
+    if inferred_direct and not (job.get("direct_application_url") or "").strip():
+        job["direct_application_url"] = inferred_direct
     linkedin_step4_note = ""
     if "linkedin.com" in job_url_raw.lower():
         linkedin_step4_note = (
@@ -653,7 +667,6 @@ Stop immediately. Output your RESULT code. Do not loop."""
 
 def build_compact_apply_prompt(
     job: dict,
-    tailored_resume: str,
     *,
     dry_run: bool = False,
     resume_excerpt_chars: int = 2_500,
@@ -663,25 +676,22 @@ def build_compact_apply_prompt(
     Uses the same resume PDF path resolution as ``build_prompt`` but omits long
     CAPTCHA / email-tool sections. The browser is driven via direct Playwright tools.
     """
+    from job_runner.apply.resume_source import resolve_apply_resume_paths
+
     profile = config.load_profile()
     search_config = config.load_search_config()
     personal = profile["personal"]
     linkedin_email = str(personal.get("linkedin_email") or "").strip()
     linkedin_password = str(personal.get("linkedin_password") or "").strip()
 
-    resume_path = job.get("tailored_resume_path")
-    if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
-    src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
-    if not src_pdf.exists():
-        raise ValueError(f"Resume PDF not found: {src_pdf}")
+    tailored_resume, src_pdf = resolve_apply_resume_paths(job)
 
     full_name = personal["full_name"]
     name_slug = full_name.replace(" ", "_")
     dest_dir = config.APPLY_WORKER_DIR / "current"
     dest_dir.mkdir(parents=True, exist_ok=True)
     upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
-    shutil.copy(str(src_pdf), str(upload_pdf))
+    shutil.copy(str(src_pdf.resolve()), str(upload_pdf))
     pdf_path = str(upload_pdf)
 
     profile_summary = _build_profile_summary(profile)
@@ -706,7 +716,9 @@ def build_compact_apply_prompt(
         f"{(linkedin_password or personal.get('password', ''))}"
     )
 
-    job_url = job.get("application_url") or job["url"]
+    job_url, inferred_direct = resolve_best_apply_url(job)
+    if inferred_direct and not (job.get("direct_application_url") or "").strip():
+        job["direct_application_url"] = inferred_direct
     field_rules_block = format_rules_for_prompt()
     linkedin_apply_note = ""
     if "linkedin.com" in ((job_url or "").lower()):
@@ -744,11 +756,13 @@ Resume PDF (upload): {pdf_path}
 {excerpt}
 
 == RULES ==
+- Some apply APIs (e.g. DeepSeek text chat) cannot accept screenshots — rely on browser_snapshot + browser_clickables + browser_form_fields only.
 - {li_login}
 - No SSO (Google/Microsoft OAuth). If forced to SSO page: RESULT:FAILED:sso_required
 - Email verification you cannot complete: RESULT:FAILED:email_verification_required
 - {submit_line}
 
+{COMPACT_APPLY_PHASES_BLOCK}
 == FORM FILLING (use LLM + tools; multi-page OK) ==
 1) On each application step, call browser_form_fields to list inputs with selectors, labels, **current_value** (already in the field), frame_index, frame_url, and suggested_answer (from saved rules). Greenhouse/Lever forms are often inside an iframe — you MUST pass the same frame_index on browser_fill / browser_select / browser_upload_file for those rows.
 2) **Do not re-fill** fields that already show the correct answer: compare each row's **current_value** to PROFILE / suggested_answer / resume. Only use browser_fill or browser_select when empty, still a placeholder, or **wrong** vs the true answer. Re-typing correct values causes loops and broken React/ATS widgets. Tools return ``skipped: already matches`` / ``skipped: already selected`` when the DOM already matches — treat that as success and move on. **School / university typeaheads:** if **current_value** already contains the PROFILE school name (even if the label is longer), **skip** and fill the next empty field (e.g. pronouns).
@@ -771,7 +785,7 @@ Resume PDF (upload): {pdf_path}
 5) If verification code is required and cannot be retrieved immediately, return RESULT:FAILED:email_verification_required (do not loop).
 
 == TOOLS ==
-Use browser_navigate, browser_snapshot, browser_form_fields, browser_click, browser_select, browser_fill (optional nth), browser_upload_file, browser_tabs, browser_wait_ms, field_answer_save.
+Use browser_navigate, browser_snapshot, browser_form_fields, browser_clickables, browser_click, browser_select, browser_fill (optional nth), browser_upload_file, browser_tabs, browser_wait_ms, field_answer_save.
 After each snapshot or form_fields result, plan the next 1–3 tool calls. Avoid long reasoning.
 
 == END ==

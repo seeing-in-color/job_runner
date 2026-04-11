@@ -678,6 +678,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "n
     Legacy LLM rewrite flow remains available via ``run_tailoring_legacy``.
     """
     _ = validation_mode  # retained for CLI compatibility
+    if not RESUME_PDF_PATH.is_file():
+        raise FileNotFoundError(
+            f"Base resume PDF not found: {RESUME_PDF_PATH}\n"
+            "Copy your master résumé PDF to that exact path, or run `job_runner init` and upload a PDF "
+            "when asked. Tailoring overlays keywords onto this file; `resume.txt` alone is not used as the PDF source."
+        )
     conn = get_connection()
     jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
     if not jobs:

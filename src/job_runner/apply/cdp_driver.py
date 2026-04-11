@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
@@ -148,6 +149,30 @@ _FORM_FIELDS_JS = r"""
 }
 """
 
+_CLICKABLES_JS = r"""
+() => {
+  const sels = 'a[href], button, [role="button"], [role="link"], input[type="submit"], input[type="button"]';
+  const rows = [];
+  for (const el of document.querySelectorAll(sels)) {
+    if (el.offsetParent === null) continue;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden') continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
+    let name = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+    if (!name) name = (el.innerText || el.value || '').trim().replace(/\s+/g, ' ');
+    if (!name) continue;
+    if (name.length > 160) name = name.slice(0, 160);
+    const tag = el.tagName.toLowerCase();
+    let href = '';
+    try { href = el.href ? String(el.href).slice(0, 220) : ''; } catch (e) {}
+    rows.push({ tag: tag, name: name, href: href });
+    if (rows.length >= 40) break;
+  }
+  return rows;
+}
+"""
+
 
 class CdpPlaywrightDriver:
     """Connect to an existing Chrome instance launched with --remote-debugging-port."""
@@ -162,13 +187,53 @@ class CdpPlaywrightDriver:
 
     def connect(self) -> None:
         self._playwright = sync_playwright().start()
-        browser = self._playwright.chromium.connect_over_cdp(self._cdp)
+        browser = None
+        last_err: Exception | None = None
+        for delay in (0.0, 0.8, 1.4, 2.2):
+            if delay:
+                time.sleep(delay)
+            try:
+                browser = self._playwright.chromium.connect_over_cdp(self._cdp)
+                break
+            except Exception as exc:
+                last_err = exc
+        if browser is None:
+            if self._playwright is not None:
+                try:
+                    self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+            if last_err:
+                raise RuntimeError(f"CDP connection failed for {self._cdp}: {last_err}") from last_err
+            raise RuntimeError(f"CDP connection failed for {self._cdp}")
         if not browser.contexts:
             ctx = browser.new_context()
             self.page = ctx.new_page()
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
             return
         ctx = browser.contexts[0]
-        self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if not ctx.pages:
+            self.page = ctx.new_page()
+        else:
+            # Prefer the last tab (usually the visible/focused one in Chrome UI).
+            # Some profiles include hidden/extension tabs first; driving those looks like "stuck on New Tab".
+            pages = list(ctx.pages)
+            chosen = pages[-1]
+            # If the last tab is internal chrome://, prefer the most recent http(s) tab if present.
+            for p in reversed(pages):
+                u = (p.url or "").strip().lower()
+                if u.startswith("http://") or u.startswith("https://"):
+                    chosen = p
+                    break
+            self.page = chosen
+        try:
+            self.page.bring_to_front()
+        except Exception:
+            pass
 
     def _frame_context(self, frame_index: int | None):
         """Main page, or a specific frame (e.g. Greenhouse/Lever iframe embed)."""
@@ -227,6 +292,37 @@ class CdpPlaywrightDriver:
                 except Exception:
                     row["frame_url"] = ""
                 merged.append(row)
+        return json.dumps(merged, ensure_ascii=False, indent=2)
+
+    def clickables_summary(self, max_total: int = 120, per_frame: int = 40) -> str:
+        """List visible links/buttons across frames (cheap when form_fields is empty).
+
+        Each row includes ``frame_index`` (same convention as ``form_fields``) for targeting clicks.
+        """
+        assert self.page is not None
+        merged: list = []
+        for fi, frame in enumerate(self.page.frames):
+            try:
+                rows = frame.evaluate(_CLICKABLES_JS)
+            except Exception:
+                continue
+            if not isinstance(rows, list):
+                continue
+            n = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if n >= per_frame:
+                    break
+                n += 1
+                row["frame_index"] = fi
+                try:
+                    row["frame_url"] = (frame.url or "")[:220]
+                except Exception:
+                    row["frame_url"] = ""
+                merged.append(row)
+                if len(merged) >= max_total:
+                    return json.dumps(merged, ensure_ascii=False, indent=2)
         return json.dumps(merged, ensure_ascii=False, indent=2)
 
     def click(

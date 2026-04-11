@@ -556,6 +556,22 @@ table.data.data--compact td {
   color: var(--muted);
 }
 
+.results-apply-vision {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem 0.55rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.results-apply-vision-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
 .results-inline-select,
 .results-inline-input,
 .results-inline-num {
@@ -746,6 +762,21 @@ table.data.data--compact td {
   word-break: break-word;
 }
 
+.job-links-cell {
+  display: grid;
+  gap: 0.2rem;
+  font-size: 0.78rem;
+}
+
+.job-search-resume {
+  margin-top: 0.2rem;
+  font-size: 0.76rem;
+}
+
+.job-search-resume code {
+  font-size: 0.74rem;
+}
+
 .modal-link-kw {
   margin: 0 0 0.75rem;
   padding: 0.5rem 0.65rem;
@@ -837,6 +868,12 @@ table.why-criteria .why-score {
   width: 4rem;
 }
 
+
+.status-bar--hint {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
 
 .status-bar {
   font-size: 0.8rem;

@@ -172,6 +172,86 @@ def try_dismiss_simplify_popup(driver: "CdpPlaywrightDriver") -> bool:
     return False
 
 
+def try_dismiss_linkedin_network_modal(driver: "CdpPlaywrightDriver") -> bool:
+    """Dismiss LinkedIn job-view overlays (e.g. \"Sign in to see who you already know\").
+
+    Clicks Artdeco dismiss / close when visible, then Escape as fallback.
+    """
+    if driver.page is None:
+        return False
+    p = driver.page
+    if "linkedin.com" not in (p.url or "").lower():
+        return False
+
+    dismiss_selectors = (
+        "button.artdeco-modal__dismiss",
+        "button.artdeco-modal__dismiss--circle",
+        "button[data-test-modal-close-btn]",
+        "button[aria-label='Dismiss']",
+        "button[aria-label='Close']",
+        '[data-test-icon="close-small"]',
+    )
+    for sel in dismiss_selectors:
+        try:
+            loc = p.locator(sel).first
+            if not loc.is_visible(timeout=900):
+                continue
+            loc.click(timeout=4000)
+            driver.wait_ms(400)
+            logger.debug("LinkedIn modal dismissed (%s)", sel)
+            return True
+        except Exception:
+            continue
+
+    for pat in (re.compile(r"^dismiss$", re.I), re.compile(r"^close$", re.I)):
+        try:
+            loc = p.get_by_role("button", name=pat)
+            if loc.count() == 0:
+                continue
+            first = loc.first
+            if not first.is_visible(timeout=700):
+                continue
+            first.click(timeout=4000)
+            driver.wait_ms(400)
+            logger.debug("LinkedIn modal dismissed (role %s)", pat.pattern)
+            return True
+        except Exception:
+            continue
+
+    try:
+        p.keyboard.press("Escape")
+        driver.wait_ms(250)
+        p.keyboard.press("Escape")
+        driver.wait_ms(250)
+        logger.debug("LinkedIn modal: Escape fallback")
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def try_linkedin_post_nav_fast(
+    driver: "CdpPlaywrightDriver",
+    *,
+    apply_url: str,
+) -> str | None:
+    """After ``navigate`` to a LinkedIn job URL: dismiss overlays and detect expired listings."""
+    if "linkedin.com" not in (apply_url or "").lower():
+        return None
+    try:
+        driver.wait_ms(800)
+        try_dismiss_cookie_banner(driver)
+        try_dismiss_linkedin_network_modal(driver)
+        driver.wait_ms(450)
+        try_dismiss_linkedin_network_modal(driver)
+        body = driver.snapshot(20_000).lower()
+        if "no longer accepting" in body or "no longer accepting applications" in body:
+            return "RESULT:EXPIRED"
+    except Exception as exc:
+        logger.debug("LinkedIn post-nav (fast) failed: %s", exc, exc_info=True)
+    return None
+
+
 def _focus_post_linkedin_apply_page(driver: "CdpPlaywrightDriver") -> None:
     """After clicking Apply on LinkedIn, focus the ATS tab or wait for same-tab navigation."""
     if driver.page is None:
@@ -1356,6 +1436,7 @@ def try_linkedin_deterministic(
         driver.navigate(apply_url)
         driver.wait_ms(1200)
         try_dismiss_cookie_banner(driver)
+        try_dismiss_linkedin_network_modal(driver)
         body = driver.snapshot(20_000).lower()
         if "no longer accepting" in body or "no longer accepting applications" in body:
             return "RESULT:EXPIRED"

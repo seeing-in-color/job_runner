@@ -13,6 +13,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 from job_runner import config
 from job_runner.database import get_connection, init_db, store_jobs
@@ -106,6 +107,28 @@ def _clean_jobspy_url(value) -> str | None:
     if not s or s.lower() in ("nan", "none", "null", "undefined"):
         return None
     return s
+
+
+def _extract_linkedin_direct_url(candidate: str | None) -> str | None:
+    """Extract off-LinkedIn target URL from LinkedIn redirect/apply links when present."""
+    if not candidate:
+        return None
+    try:
+        parsed = urlparse(candidate)
+        host = (parsed.netloc or "").lower()
+        if "linkedin.com" not in host:
+            return candidate
+        qs = parse_qs(parsed.query)
+        for key in ("url", "redirect", "redirectUrl", "dest", "destination", "target"):
+            raw = (qs.get(key) or [None])[0]
+            if not raw:
+                continue
+            v = unquote(str(raw).strip())
+            if v.startswith("http://") or v.startswith("https://"):
+                return v
+    except Exception:
+        return None
+    return None
 
 
 # -- Proxy parsing -----------------------------------------------------------
@@ -307,7 +330,9 @@ def store_jobspy_results(
                 continue
 
         # Extract apply URL if JobSpy provided it (avoid str(None) → "None" in SQLite)
-        apply_url = _clean_jobspy_url(row.get("job_url_direct"))
+        apply_url_raw = _clean_jobspy_url(row.get("job_url_direct"))
+        direct_apply_url = _extract_linkedin_direct_url(apply_url_raw)
+        apply_url = apply_url_raw
         # LinkedIn often omits a direct company apply URL; use the posting URL
         # so users can still open the correct role and apply there.
         if not apply_url and "linkedin" in (site_name or "").lower():
@@ -316,10 +341,10 @@ def store_jobspy_results(
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "search_query, full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "search_query, full_description, application_url, direct_application_url, detail_scraped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, title, salary, description, location_str, site_label, strategy, now,
-                 search_query, full_description, apply_url, detail_scraped_at),
+                 search_query, full_description, apply_url, direct_apply_url, detail_scraped_at),
             )
             new += 1
         except sqlite3.IntegrityError:

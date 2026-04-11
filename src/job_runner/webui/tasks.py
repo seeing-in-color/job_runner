@@ -33,6 +33,8 @@ def _pipeline_env() -> dict[str, str]:
     src = str((repo_root() / "src").resolve())
     prev = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = src if not prev else src + os.pathsep + prev
+    # Show subprocess logs immediately in the web UI terminal (no pipe buffering delay).
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 
@@ -458,7 +460,7 @@ def build_run_command(body: dict) -> list[str]:
 
 def build_apply_command(body: dict) -> list[str]:
     """Build ``python -m job_runner apply ...`` from UI payload."""
-    cmd: list[str] = [sys.executable, "-m", "job_runner", "apply"]
+    cmd: list[str] = [sys.executable, "-u", "-m", "job_runner", "apply"]
     agent = str(body.get("agent", "") or "").strip().lower()
     model = str(body.get("model", "") or "").strip()
     workers = int(body.get("workers", 1) or 1)
@@ -479,5 +481,21 @@ def build_apply_command(body: dict) -> list[str]:
         cmd.append("--headless")
     if body.get("dry_run"):
         cmd.append("--dry-run")
+    cprof = str(body.get("chrome_seed_profile_dir", "") or "").strip()
+    cseed = str(body.get("chrome_seed_user_data_dir", "") or "").strip()
+    if cprof:
+        cmd.extend(["--chrome-seed-profile-dir", cprof])
+    if cseed:
+        cmd.extend(["--chrome-seed-user-data-dir", cseed])
+    if body.get("chrome_reseed"):
+        cmd.append("--chrome-reseed")
+
+    vn = str(body.get("vision_stuck_nudge") or "auto").strip().lower()
+    if vn in ("on", "1", "true", "yes"):
+        cmd.extend(["--vision-stuck-nudge", "on"])
+    elif vn in ("off", "0", "false", "no"):
+        cmd.extend(["--vision-stuck-nudge", "off"])
+    else:
+        cmd.extend(["--vision-stuck-nudge", "auto"])
 
     return cmd

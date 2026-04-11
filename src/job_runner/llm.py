@@ -3,6 +3,7 @@ Unified LLM client for Job Runner.
 
 Auto-detects provider from environment:
   OPENAI_API_KEY  -> OpenAI Chat Completions (default: gpt-4o-mini) — used when set
+  DEEPSEEK_API_KEY -> DeepSeek Chat Completions (OpenAI-compatible; default base https://api.deepseek.com/v1, model deepseek-chat)
   GEMINI_API_KEY  -> Google Gemini native generateContent (default: gemini-2.5-flash) — if no OpenAI key
   ANTHROPIC_API_KEY -> Anthropic Messages API (default: claude-3-5-haiku-latest)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
@@ -65,7 +66,9 @@ def _detect_provider() -> tuple[str, str, str]:
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     openai_base = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+    deepseek_base = os.environ.get("DEEPSEEK_BASE_URL", "").strip() or "https://api.deepseek.com/v1"
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
@@ -76,6 +79,18 @@ def _detect_provider() -> tuple[str, str, str]:
             if not openai_key:
                 raise RuntimeError("LLM_PROVIDER=openai but OPENAI_API_KEY is missing.")
             return (openai_base.rstrip("/"), model_override or "gpt-4o-mini", openai_key)
+        if provider_override == "deepseek":
+            key = deepseek_key or openai_key
+            if not key:
+                raise RuntimeError(
+                    "LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY (or OPENAI_API_KEY) is missing."
+                )
+            base = (
+                os.environ.get("DEEPSEEK_BASE_URL", "").strip()
+                or os.environ.get("OPENAI_BASE_URL", "").strip()
+                or "https://api.deepseek.com/v1"
+            )
+            return (base.rstrip("/"), model_override or "deepseek-chat", key)
         if provider_override == "gemini":
             if not gemini_key:
                 raise RuntimeError("LLM_PROVIDER=gemini but GEMINI_API_KEY is missing.")
@@ -88,7 +103,9 @@ def _detect_provider() -> tuple[str, str, str]:
             if not local_url:
                 raise RuntimeError("LLM_PROVIDER=local but LLM_URL is missing.")
             return (local_url.rstrip("/"), model_override or "local-model", os.environ.get("LLM_API_KEY", ""))
-        raise RuntimeError("Unknown LLM_PROVIDER. Use one of: openai, gemini, anthropic, local.")
+        raise RuntimeError(
+            "Unknown LLM_PROVIDER. Use one of: openai, deepseek, gemini, anthropic, local."
+        )
 
     # Prefer OpenAI when OPENAI_API_KEY is set (scoring + all LLM stages use this client).
     if openai_key and not local_url:
@@ -96,6 +113,13 @@ def _detect_provider() -> tuple[str, str, str]:
             openai_base.rstrip("/"),
             model_override or "gpt-4o-mini",
             openai_key,
+        )
+
+    if deepseek_key and not local_url:
+        return (
+            deepseek_base.rstrip("/"),
+            model_override or "deepseek-chat",
+            deepseek_key,
         )
 
     if gemini_key and not local_url:
@@ -122,7 +146,7 @@ def _detect_provider() -> tuple[str, str, str]:
 
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set OPENAI_API_KEY, GEMINI_API_KEY, or LLM_URL in your environment."
+        "Set OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, or LLM_URL in your environment."
     )
 
 

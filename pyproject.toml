@@ -62,7 +62,7 @@ build-backend = "hatchling.build"
 packages = ["src/job_runner"]
 
 [tool.hatch.build]
-artifacts = ["src/job_runner/config/*.yaml"]
+artifacts = ["src/job_runner/config/*.yaml", "src/job_runner/config/*.json"]
 
 [tool.ruff]
 target-version = "py311"

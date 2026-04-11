@@ -38,6 +38,22 @@ async function ensureUiSession() {
   return true;
 }
 
+/** Turn generic fetch failures into a short hint (browser messages vary). */
+function friendlyNetworkError(e) {
+  const m = String((e && e.message) || e || "");
+  const low = m.toLowerCase();
+  if (
+    low.includes("failed to fetch") ||
+    low.includes("networkerror") ||
+    low.includes("load failed") ||
+    low.includes("connection") ||
+    low.includes("network request failed")
+  ) {
+    return "Can't reach the Job Runner server. In a terminal run: job_runner ui — then open http://127.0.0.1:8844/ on this machine (same PC as the terminal).";
+  }
+  return m;
+}
+
 function terminalSet(text) {
   const el = $("#terminal-output");
   if (!el) return;
@@ -145,7 +161,13 @@ async function loadMeta() {
         }
       `;
     }
-  } catch (_) {}
+  } catch (e) {
+    const sd = $("#sidebar-data");
+    if (sd) {
+      sd.hidden = false;
+      sd.innerHTML = `<div class="sidebar-data__title">Connection</div><p class="sidebar-data__hint sidebar-data__hint--warn">${esc(friendlyNetworkError(e))}</p>`;
+    }
+  }
   refreshUsage();
 }
 
@@ -155,6 +177,7 @@ async function loadDashboard() {
   try {
     const r = await api("/dashboard");
     const s = await r.json();
+    if (!r.ok) throw new Error(apiDetailMessage(s) || r.statusText || "Dashboard request failed");
     const grid = $("#dash-stats");
     if (!grid) return;
     const items = [
@@ -174,7 +197,7 @@ async function loadDashboard() {
       .join("");
     if (status) status.textContent = "Updated " + new Date().toLocaleString();
   } catch (e) {
-    if (status) status.textContent = String(e.message || e);
+    if (status) status.textContent = friendlyNetworkError(e);
   }
 }
 
@@ -384,12 +407,19 @@ async function runResultsApply() {
     model: ($("#apply-model") && $("#apply-model").value.trim()) || "",
     limit: parseInt((($("#apply-limit") && $("#apply-limit").value) || "5"), 10) || 5,
     workers: parseInt((($("#apply-workers") && $("#apply-workers").value) || "1"), 10) || 1,
-    min_score: 7,
+    min_score: 6,
     dry_run: false,
     headless: false,
+    vision_stuck_nudge: visionStuckNudgeFromApplyUI(),
+    chrome_seed_profile_dir: ($("#apply-chrome-profile") && $("#apply-chrome-profile").value.trim()) || "",
+    chrome_reseed: !!($("#apply-chrome-reseed") && $("#apply-chrome-reseed").checked),
   };
   saveApplyPrefs(body);
-  if (status) status.textContent = "Starting apply…";
+  if (status) {
+    status.textContent =
+      "Starting apply… Watch the Terminal panel below (scroll down if hidden). Chrome opens when a job is picked.";
+  }
+  terminalAppend("\n── Apply starting — check Terminal below; Chrome launches after a job is acquired. ──\n");
   if (costEl) costEl.textContent = "Apply run cost (est): preparing baseline…";
   try {
     const u = await getUsageSummary();
@@ -417,6 +447,27 @@ async function runResultsApply() {
   }
 }
 
+/** @returns {"auto"|"on"|"off"} */
+function visionStuckNudgeFromApplyUI() {
+  const on = $("#apply-vision-on") && $("#apply-vision-on").checked;
+  const off = $("#apply-vision-off") && $("#apply-vision-off").checked;
+  if (on) return "on";
+  if (off) return "off";
+  return "auto";
+}
+
+function wireApplyVisionCheckboxes() {
+  const onEl = $("#apply-vision-on");
+  const offEl = $("#apply-vision-off");
+  if (!onEl || !offEl) return;
+  onEl.addEventListener("change", () => {
+    if (onEl.checked) offEl.checked = false;
+  });
+  offEl.addEventListener("change", () => {
+    if (offEl.checked) onEl.checked = false;
+  });
+}
+
 function saveApplyPrefs(body) {
   try {
     const prefs = {
@@ -424,22 +475,72 @@ function saveApplyPrefs(body) {
       model: body.model || "",
       limit: Number(body.limit || 5),
       workers: Number(body.workers || 1),
+      vision_stuck_nudge: body.vision_stuck_nudge || "auto",
+      chrome_seed_profile_dir: body.chrome_seed_profile_dir || "",
+      chrome_reseed: !!body.chrome_reseed,
     };
     localStorage.setItem(APPLY_PREFS_KEY, JSON.stringify(prefs));
   } catch (_) {}
 }
 
-function loadApplyPrefs() {
+function getSavedApplyPrefs() {
   try {
     const raw = localStorage.getItem(APPLY_PREFS_KEY);
-    if (!raw) return;
+    if (!raw) return {};
     const p = JSON.parse(raw);
+    return p && typeof p === "object" ? p : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function loadApplyPrefs() {
+  try {
+    const p = getSavedApplyPrefs();
     if ($("#apply-agent") && p.agent) $("#apply-agent").value = String(p.agent);
     if ($("#apply-model") && p.model) $("#apply-model").value = String(p.model);
     if ($("#apply-limit") && p.limit != null) $("#apply-limit").value = String(p.limit);
     if ($("#apply-workers") && p.workers != null) $("#apply-workers").value = String(p.workers);
+    if ($("#apply-chrome-profile") && p.chrome_seed_profile_dir != null) {
+      $("#apply-chrome-profile").value = String(p.chrome_seed_profile_dir || "");
+    }
+    if ($("#apply-chrome-reseed") && p.chrome_reseed != null) {
+      $("#apply-chrome-reseed").checked = !!p.chrome_reseed;
+    }
+    const vs = p.vision_stuck_nudge || "auto";
+    if ($("#apply-vision-on") && $("#apply-vision-off")) {
+      $("#apply-vision-on").checked = vs === "on";
+      $("#apply-vision-off").checked = vs === "off";
+    }
     syncModelPresetFromText();
   } catch (_) {}
+}
+
+async function loadChromeProfiles() {
+  const sel = $("#apply-chrome-profile");
+  if (!sel) return;
+  const saved = getSavedApplyPrefs();
+  const want = String(saved.chrome_seed_profile_dir || sel.value || "").trim();
+  sel.innerHTML = '<option value="">Auto (default)</option>';
+  try {
+    const r = await api("/chrome/profiles");
+    const j = await r.json().catch(() => ({}));
+    const profiles = Array.isArray(j.profiles) ? j.profiles : [];
+    for (const p of profiles) {
+      const dir = String((p && p.dir) || "").trim();
+      if (!dir) continue;
+      const label = String((p && p.label) || dir).trim();
+      const o = document.createElement("option");
+      o.value = dir;
+      o.textContent = `${label} (${dir})`;
+      sel.appendChild(o);
+    }
+  } catch (_) {}
+  if (want && Array.from(sel.options).some((o) => o.value === want)) {
+    sel.value = want;
+  } else {
+    sel.value = "";
+  }
 }
 
 function syncModelPresetFromText() {
@@ -574,6 +675,22 @@ async function saveCriteriaInternal() {
   if (!r.ok) throw new Error(apiDetailMessage(j) || "Save failed");
 }
 
+function scorePresetFromScoreTab() {
+  let scoreProvider = null;
+  let scoreModel = null;
+  const preset = $("#score-model-preset");
+  if (preset && preset.value && preset.value.includes("|")) {
+    const parts = preset.value.split("|", 2);
+    scoreProvider = (parts[0] || "").trim();
+    scoreModel = (parts[1] || "").trim();
+  }
+  return { scoreProvider, scoreModel };
+}
+
+/* Tailor résumés button disabled — pipeline tailor optional; apply uses role_resumes/ + resume.pdf.
+async function runTailor() { ... }
+*/
+
 async function runScore() {
   const status = $("#score-status");
   if (status) status.textContent = "Saving…";
@@ -581,17 +698,12 @@ async function runScore() {
     await saveCriteriaInternal();
     if (status) status.textContent = "Starting score…";
     terminalAppend("\n── " + new Date().toLocaleString() + " ──\n");
-    let scoreProvider = null;
-    let scoreModel = null;
-    const preset = $("#score-model-preset");
-    if (preset && preset.value && preset.value.includes("|")) {
-      const parts = preset.value.split("|", 2);
-      scoreProvider = (parts[0] || "").trim();
-      scoreModel = (parts[1] || "").trim();
-    }
+    const { scoreProvider, scoreModel } = scorePresetFromScoreTab();
     const payload = { stages: ["score"] };
     if (scoreProvider) payload.score_provider = scoreProvider;
     if (scoreModel) payload.score_model = scoreModel;
+    const rescoreEl = $("#score-rescore");
+    if (rescoreEl && rescoreEl.checked) payload.rescore = true;
     const r = await api("/pipeline/run", { method: "POST", body: JSON.stringify(payload) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(apiDetailMessage(j) || r.statusText || "Run failed");
@@ -647,6 +759,24 @@ function buildResultRowHtml(row) {
     fs == null ? "—" : `<span class="score-pill ${scoreClass(fs)}">${esc(String(fs))}</span>`;
   const title = esc(row.title || "—");
   const url = row.url || "";
+  const postingUrl = String(row.url || "").trim();
+  const candidateDirectUrl = String(row.direct_application_url || "").trim();
+  const postingNorm = postingUrl.toLowerCase().replace(/\/+$/, "");
+  const directNorm = candidateDirectUrl.toLowerCase().replace(/\/+$/, "");
+  let directHost = "";
+  try {
+    directHost = new URL(candidateDirectUrl).hostname.toLowerCase();
+  } catch (_) {}
+  const isLinkedinDirect = directHost.includes("linkedin.com");
+  const isDistinctDirect = !!candidateDirectUrl && directNorm !== postingNorm && !isLinkedinDirect;
+  const directUrl = isDistinctDirect ? candidateDirectUrl : "";
+  const postingLink = postingUrl
+    ? `<a href="${escAttr(postingUrl)}" target="_blank" rel="noopener">Posting</a>`
+    : "—";
+  const directLink = directUrl
+    ? `<a href="${escAttr(directUrl)}" target="_blank" rel="noopener">Direct</a>`
+    : "—";
+  const linksCell = `<div class="job-links-cell"><div>${postingLink}</div><div>${directLink}</div></div>`;
   const roleStar =
     row.has_role_resume_for_query
       ? '<span class="role-resume-star" title="Discovered with this search keyword and a role-specific résumé">*</span>'
@@ -658,14 +788,20 @@ function buildResultRowHtml(row) {
   const trk = trackSelectHtml(url, row.application_track);
   const sqFull = String(row.search_query || "").trim();
   const sq = esc(sqFull ? sqFull.slice(0, 48) : "—");
+  const linkedResume = String(row.linked_role_resume_filename || "").trim();
+  const linkedResumeShort = linkedResume.length > 28 ? linkedResume.slice(0, 28) + "…" : linkedResume;
+  const linkedResumeHint = linkedResume
+    ? `<div class="job-search-resume" title="${escAttr(linkedResume)}">Resume: <code>${esc(linkedResumeShort)}</code></div>`
+    : `<div class="job-search-resume cell-muted">Resume: none</div>`;
   const linkBtn = sqFull
-    ? `<button type="button" class="btn btn-ghost btn-tiny results-link-resume" data-link-sq="${escAttr(sqFull)}" title="Link a résumé for this discovery keyword">Link</button>`
+    ? `<button type="button" class="btn btn-ghost btn-tiny results-link-resume" data-link-sq="${escAttr(sqFull)}" data-link-fn="${escAttr(linkedResume)}" title="Link a résumé for this discovery keyword">${linkedResume ? "Change" : "Link"}</button>`
     : "";
   return `<tr data-url="${escAttr(url)}">
     <td><a href="${escAttr(url)}" target="_blank" rel="noopener">${title}</a>${roleStar}</td>
+    <td class="cell-muted">${linksCell}</td>
     <td>${esc(row.site || "—")}</td>
     <td>${pill}</td>
-    <td class="cell-muted cell-job-search"><div class="job-search-cell"><span class="job-search-text">${sq}</span>${linkBtn}</div></td>
+    <td class="cell-muted cell-job-search"><div class="job-search-cell"><span class="job-search-text">${sq}</span>${linkBtn}</div>${linkedResumeHint}</td>
     <td class="cell-track">${trk}</td>
     <td>${why}</td>
   </tr>`;
@@ -702,6 +838,21 @@ function resultsQueryParams() {
   if (q.trim()) params.set("q", q.trim());
   if (site) params.set("site", site);
   return params;
+}
+
+function exportResultsCsv() {
+  const status = $("#results-status");
+  const params = resultsQueryParams();
+  params.delete("limit");
+  params.delete("offset");
+  const href = "/api/jobs/export.csv?" + params.toString();
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = "job_runner_results.csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  if (status) status.textContent = "CSV export started.";
 }
 
 function syncResultsScoreSortUi() {
@@ -789,6 +940,7 @@ function scheduleResultsRefetch() {
 
 async function loadResults() {
   syncResultsScoreSortUi();
+  await loadChromeProfiles();
   await loadResultSites();
   await resetAndFetchResults();
 }
@@ -900,7 +1052,7 @@ function closeLinkResumeModal() {
   if (fi) fi.value = "";
 }
 
-async function openLinkResumeModal(searchQuery) {
+async function openLinkResumeModal(searchQuery, selectedFilename) {
   const modal = $("#modal-link-resume");
   const kwEl = $("#modal-link-resume-kw");
   const sel = $("#modal-link-resume-select");
@@ -910,7 +1062,7 @@ async function openLinkResumeModal(searchQuery) {
   if (!modalLinkResumeKeyword) return;
   kwEl.textContent = modalLinkResumeKeyword;
   if (st) st.textContent = "Loading files…";
-  sel.innerHTML = '<option value="">—</option>';
+  sel.innerHTML = '<option value="">— Clear linked résumé —</option>';
   try {
     const r = await api("/role-resumes");
     const j = await r.json();
@@ -923,6 +1075,11 @@ async function openLinkResumeModal(searchQuery) {
       o.textContent = fn;
       sel.appendChild(o);
     }
+    if (selectedFilename && files.some((f) => f.filename === selectedFilename)) {
+      sel.value = selectedFilename;
+    } else {
+      sel.value = "";
+    }
     if (st) st.textContent = files.length ? "" : "No files yet — upload one below.";
   } catch (e) {
     if (st) st.textContent = String(e.message || e);
@@ -934,20 +1091,19 @@ async function submitLinkResumeExisting() {
   const st = $("#modal-link-resume-status");
   const sel = $("#modal-link-resume-select");
   if (!modalLinkResumeKeyword) return;
-  const fn = sel && sel.value;
-  if (!fn) {
-    if (st) st.textContent = "Pick a file or upload a new one.";
-    return;
-  }
+  const fn = (sel && sel.value) || "";
   if (st) st.textContent = "Saving…";
   try {
     const r = await api("/interests/link", {
       method: "POST",
-      body: JSON.stringify({ search_query: modalLinkResumeKeyword, resume_filename: fn }),
+      body: JSON.stringify({
+        search_query: modalLinkResumeKeyword,
+        resume_filename: fn ? fn : null,
+      }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(apiDetailMessage(j));
-    if (st) st.textContent = "Linked.";
+    if (st) st.textContent = fn ? "Linked." : "Cleared.";
     closeLinkResumeModal();
     await resetAndFetchResults();
   } catch (e) {
@@ -1258,6 +1414,7 @@ function wireNav() {
   $("#btn-delete-all-jobs") && $("#btn-delete-all-jobs").addEventListener("click", deleteAllJobs);
   $("#btn-results-apply") && $("#btn-results-apply").addEventListener("click", runResultsApply);
   $("#btn-results-refresh") && $("#btn-results-refresh").addEventListener("click", () => resetAndFetchResults());
+  $("#btn-results-export-csv") && $("#btn-results-export-csv").addEventListener("click", exportResultsCsv);
   ["filter-q", "filter-site"].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -1294,7 +1451,8 @@ function wireResultsSection() {
     const linkBtn = ev.target.closest(".results-link-resume");
     if (linkBtn) {
       const sq = linkBtn.getAttribute("data-link-sq");
-      if (sq) void openLinkResumeModal(sq);
+      const fn = linkBtn.getAttribute("data-link-fn") || "";
+      if (sq) void openLinkResumeModal(sq, fn);
     }
   });
   sec.addEventListener("change", (ev) => {
@@ -1369,6 +1527,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   wireSettingsRolePack();
   wireFindSlotsSection();
   wireApplyModelControls();
+  wireApplyVisionCheckboxes();
   loadApplyPrefs();
   loadMeta();
   showSection("dashboard");

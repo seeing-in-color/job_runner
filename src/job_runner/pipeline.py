@@ -148,6 +148,12 @@ def _run_score(
         if score_print_profile is not None:
             kw["print_candidate_profile"] = score_print_profile
         run_scoring(**kw)
+        try:
+            from job_runner.apply.resume_source import sync_apply_ready_flags
+
+            sync_apply_ready_flags()
+        except Exception as e:
+            log.warning("apply_ready sync after score failed: %s", e)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)

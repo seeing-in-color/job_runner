@@ -65,6 +65,8 @@ APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
+# Bundled starter profile (same shape as repo-root ``profile.example.json``).
+PROFILE_EXAMPLE_PATH = CONFIG_DIR / "profile.example.json"
 
 
 def get_chrome_path() -> str:
@@ -120,6 +122,92 @@ def get_chrome_user_data() -> Path:
         return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
     else:
         return Path.home() / ".config" / "google-chrome"
+
+
+def ensure_profile_stub_for_apply() -> Path | None:
+    """If no ``profile.json`` exists in the project or ``APP_DIR``, copy the bundled example.
+
+    Auto-apply requires ``load_profile()`` to succeed. This seeds ``APP_DIR/profile.json`` so you can
+    edit real contact details without running the full ``job_runner init`` wizard.
+
+    Returns the path that will be used (project ``./profile.json`` wins when present), or ``None`` if
+    a profile file already existed.
+    """
+    import json
+
+    load_env()
+    ensure_dirs()
+    if PROJECT_PROFILE_PATH.exists():
+        return None
+    if PROFILE_PATH.exists():
+        return None
+    if PROFILE_EXAMPLE_PATH.is_file():
+        shutil.copy2(PROFILE_EXAMPLE_PATH, PROFILE_PATH)
+        return PROFILE_PATH
+    # Broken install: write a minimal valid structure (apply prompt expects these keys).
+    stub = {
+        "personal": {
+            "full_name": "Edit Me",
+            "preferred_name": "",
+            "email": "edit@example.com",
+            "password": "",
+            "phone": "",
+            "address": "",
+            "city": "",
+            "province_state": "",
+            "country": "",
+            "postal_code": "",
+            "linkedin_url": "",
+            "github_url": "",
+            "portfolio_url": "",
+            "website_url": "",
+        },
+        "work_authorization": {
+            "legally_authorized_to_work": "Yes",
+            "require_sponsorship": "No",
+            "work_permit_type": "",
+        },
+        "availability": {
+            "earliest_start_date": "Immediately",
+            "available_for_full_time": "Yes",
+            "available_for_contract": "No",
+        },
+        "compensation": {
+            "salary_expectation": "80000",
+            "salary_currency": "USD",
+            "salary_range_min": "75000",
+            "salary_range_max": "95000",
+            "currency_conversion_note": "",
+        },
+        "education": {
+            "school": "",
+            "degree": "",
+            "discipline": "",
+            "discipline_fallback": "",
+        },
+        "experience": {
+            "years_of_experience_total": "0",
+            "education_level": "",
+            "current_job_title": "",
+            "current_company": "",
+            "target_role": "",
+        },
+        "skills_boundary": {"languages": [], "frameworks": [], "devops": [], "databases": [], "tools": []},
+        "resume_facts": {
+            "preserved_companies": [],
+            "preserved_projects": [],
+            "preserved_school": "",
+            "real_metrics": [],
+        },
+        "eeo_voluntary": {
+            "gender": "Decline to self-identify",
+            "race_ethnicity": "Decline to self-identify",
+            "veteran_status": "I am not a protected veteran",
+            "disability_status": "I do not wish to answer",
+        },
+    }
+    PROFILE_PATH.write_text(json.dumps(stub, indent=2), encoding="utf-8")
+    return PROFILE_PATH
 
 
 def ensure_dirs():
@@ -242,12 +330,32 @@ def load_base_urls() -> dict[str, str | None]:
 
 DEFAULTS = {
     "min_score": 7,
+    "apply_ready_min_score": 8,
     "max_apply_attempts": 3,
     "max_tailor_attempts": 5,
     "poll_interval": 60,
     "apply_timeout": 300,
     "viewport": "1280x900",
 }
+
+
+def get_apply_ready_min_score() -> int:
+    """Minimum fit_score (1--10) to auto-mark a job as ready for apply.
+
+    Default ``8`` means strictly *above* 7. Set ``JOB_RUNNER_APPLY_READY_MIN_SCORE=7``
+    to include scores 7 and up.
+
+    Environment: ``JOB_RUNNER_APPLY_READY_MIN_SCORE`` (default from ``DEFAULTS``).
+    """
+    load_env()
+    raw = os.environ.get(
+        "JOB_RUNNER_APPLY_READY_MIN_SCORE",
+        str(DEFAULTS["apply_ready_min_score"]),
+    )
+    try:
+        return max(1, min(10, int(raw)))
+    except (TypeError, ValueError):
+        return int(DEFAULTS["apply_ready_min_score"])
 
 
 def get_max_apply_attempts() -> int:
@@ -280,13 +388,17 @@ def get_apply_agent_provider() -> str:
     """Which backend runs browser apply: ``claude`` (Claude Code CLI) or ``openai`` (API + CDP).
 
     Env: ``JOB_RUNNER_APPLY_AGENT`` = ``claude`` | ``openai``.
-    Default: ``openai`` if ``OPENAI_API_KEY`` is set, else ``claude``.
+    Default: ``openai`` if ``OPENAI_API_KEY`` or ``DEEPSEEK_API_KEY`` is set, else ``claude``.
     """
     load_env()
     raw = os.environ.get("JOB_RUNNER_APPLY_AGENT", "").strip().lower()
     if raw in ("claude", "openai"):
         return raw
-    return "openai" if os.environ.get("OPENAI_API_KEY") else "claude"
+    return (
+        "openai"
+        if (os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY"))
+        else "claude"
+    )
 
 
 def get_apply_openai_model() -> str:
@@ -298,32 +410,113 @@ def get_apply_openai_model() -> str:
 def get_apply_openai_api_key() -> str:
     """API key for OpenAI-compatible apply agent requests.
 
-    Prefers ``JOB_RUNNER_APPLY_OPENAI_API_KEY`` and falls back to ``OPENAI_API_KEY``.
+    Prefers ``JOB_RUNNER_APPLY_OPENAI_API_KEY``, then ``OPENAI_API_KEY``, then ``DEEPSEEK_API_KEY``.
     """
     load_env()
     return (
         os.environ.get("JOB_RUNNER_APPLY_OPENAI_API_KEY", "").strip()
         or os.environ.get("OPENAI_API_KEY", "").strip()
+        or os.environ.get("DEEPSEEK_API_KEY", "").strip()
     )
 
 
 def get_apply_openai_base_url() -> str | None:
     """Optional OpenAI-compatible base URL for apply agent requests.
 
-    Order: ``JOB_RUNNER_APPLY_OPENAI_BASE_URL`` then ``OPENAI_BASE_URL``.
+    Order: ``JOB_RUNNER_APPLY_OPENAI_BASE_URL``, ``OPENAI_BASE_URL``, ``DEEPSEEK_BASE_URL``.
     Returns ``None`` when unset so SDK defaults apply.
     """
     load_env()
     raw = (
         os.environ.get("JOB_RUNNER_APPLY_OPENAI_BASE_URL", "").strip()
         or os.environ.get("OPENAI_BASE_URL", "").strip()
+        or os.environ.get("DEEPSEEK_BASE_URL", "").strip()
     )
     return raw or None
 
 
-def get_apply_deterministic_first() -> bool:
-    """Run fast deterministic checks (e.g. expired LinkedIn) before calling the LLM."""
+def _is_openai_native_model(model: str | None) -> bool:
+    m = (model or "").strip().lower()
+    return m.startswith("gpt-") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+
+
+def _is_deepseek_model(model: str | None) -> bool:
+    return "deepseek" in ((model or "").strip().lower())
+
+
+def resolve_apply_openai_client(model: str | None = None) -> tuple[str, str | None]:
+    """Resolve API key/base URL for the selected apply model.
+
+    Prevents routing OpenAI-native models (e.g. gpt-4.1-mini) to DeepSeek endpoints.
+    """
     load_env()
+    selected = (model or get_apply_openai_model()).strip()
+    selected_l = selected.lower()
+
+    apply_key = os.environ.get("JOB_RUNNER_APPLY_OPENAI_API_KEY", "").strip()
+    apply_base = os.environ.get("JOB_RUNNER_APPLY_OPENAI_BASE_URL", "").strip()
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    openai_base = os.environ.get("OPENAI_BASE_URL", "").strip()
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    deepseek_base = os.environ.get("DEEPSEEK_BASE_URL", "").strip() or "https://api.deepseek.com/v1"
+
+    # OpenAI-native models should use OpenAI creds/base unless user explicitly configured
+    # a non-DeepSeek compatible endpoint override.
+    if _is_openai_native_model(selected_l):
+        if apply_key and apply_base and "deepseek" not in apply_base.lower():
+            return apply_key, apply_base
+        if openai_key:
+            return openai_key, (openai_base or None)
+        raise RuntimeError(
+            f"Model '{selected}' requires OpenAI credentials. Set OPENAI_API_KEY, "
+            "or set both JOB_RUNNER_APPLY_OPENAI_API_KEY and JOB_RUNNER_APPLY_OPENAI_BASE_URL "
+            "(non-DeepSeek endpoint)."
+        )
+
+    # DeepSeek models should prefer DeepSeek endpoint by default.
+    if _is_deepseek_model(selected_l):
+        key = apply_key or deepseek_key or openai_key
+        if not key:
+            raise RuntimeError(
+                f"Model '{selected}' requires an API key. Set DEEPSEEK_API_KEY "
+                "or JOB_RUNNER_APPLY_OPENAI_API_KEY."
+            )
+        if apply_base:
+            return key, apply_base
+        return key, deepseek_base
+
+    # Generic OpenAI-compatible fallback (preserves previous behavior).
+    key = apply_key or openai_key or deepseek_key
+    base = apply_base or openai_base or deepseek_base
+    if not key:
+        raise RuntimeError(
+            "OpenAI-compatible apply agent key missing. Set JOB_RUNNER_APPLY_OPENAI_API_KEY "
+            "or OPENAI_API_KEY or DEEPSEEK_API_KEY."
+        )
+    return key, (base or None)
+
+
+def get_apply_fast_mode() -> bool:
+    """Prefer LLM tool loop over deterministic prefill / recovery (much faster).
+
+    When True (default): skip LinkedIn/dropdown prefill before the model, skip deterministic
+    recovery between turns, and skip heavy form-field enrichment — the model uses tools only.
+
+    Set ``JOB_RUNNER_APPLY_FAST=0`` to restore the previous slower, more heuristic-heavy path.
+    """
+    load_env()
+    v = os.environ.get("JOB_RUNNER_APPLY_FAST", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def get_apply_deterministic_first() -> bool:
+    """Run fast deterministic checks (e.g. expired LinkedIn) before calling the LLM.
+
+    Disabled automatically when :func:`get_apply_fast_mode` is True.
+    """
+    load_env()
+    if get_apply_fast_mode():
+        return False
     v = os.environ.get("JOB_RUNNER_APPLY_DETERMINISTIC_FIRST", "1").strip().lower()
     return v not in ("0", "false", "no", "off")
 
@@ -335,6 +528,44 @@ def get_apply_openai_max_turns() -> int:
         return max(3, int(os.environ.get("JOB_RUNNER_APPLY_OPENAI_MAX_TURNS", "20")))
     except (TypeError, ValueError):
         return 20
+
+
+def get_apply_openai_request_timeout_seconds() -> float:
+    """Per-request timeout for OpenAI-compatible apply model calls.
+
+    Environment override: ``JOB_RUNNER_APPLY_OPENAI_REQUEST_TIMEOUT_SEC`` (default ``70``).
+    """
+    load_env()
+    raw = os.environ.get("JOB_RUNNER_APPLY_OPENAI_REQUEST_TIMEOUT_SEC", "70").strip()
+    try:
+        return max(10.0, float(raw))
+    except (TypeError, ValueError):
+        return 70.0
+
+
+def get_apply_vision_stuck_nudge(model: str | None = None) -> bool:
+    """Whether to attach a viewport screenshot when the agent is stuck (multimodal models only).
+
+    ``JOB_RUNNER_APPLY_VISION_STUCK_NUDGE``:
+    - ``auto`` (default): enable except for known non-vision endpoints (e.g. DeepSeek Chat API).
+    - ``1`` / ``0``: force on or off.
+
+    DeepSeek's text chat API does not accept image parts reliably; auto disables vision nudges
+    when the model name or apply base URL looks like DeepSeek unless forced on.
+    """
+    load_env()
+    raw = os.environ.get("JOB_RUNNER_APPLY_VISION_STUCK_NUDGE", "auto").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    m = (model or os.environ.get("JOB_RUNNER_APPLY_OPENAI_MODEL", "") or "").strip().lower()
+    if "deepseek" in m:
+        return False
+    bu = (get_apply_openai_base_url() or "").lower()
+    if "deepseek" in bu:
+        return False
+    return True
 
 
 def get_job_runner_llm_delay() -> float:
@@ -352,11 +583,22 @@ def get_job_runner_llm_delay() -> float:
 
 
 def load_env():
-    """Load environment variables from ~/.job_runner/.env if it exists."""
+    """Load environment variables from env files.
+
+    Order:
+    1. ``~/.job_runner/.env`` — shared secrets and ``JOB_RUNNER_DIR`` (bootstrap already read the latter).
+    2. ``$JOB_RUNNER_DIR/.env`` when different from (1) — overrides for the data directory (e.g. Dropbox on another PC).
+
+    Without (1), Tier 2+ keys in the home file were ignored whenever ``JOB_RUNNER_DIR`` pointed elsewhere.
+    """
     from dotenv import load_dotenv
-    if ENV_PATH.exists():
-        load_dotenv(ENV_PATH)
-    # Also try CWD .env as fallback
+
+    legacy = _legacy_dotenv_path()
+    if legacy.is_file():
+        load_dotenv(legacy)
+    if ENV_PATH.is_file():
+        if not legacy.is_file() or ENV_PATH.resolve() != legacy.resolve():
+            load_dotenv(ENV_PATH, override=True)
     load_dotenv()
 
 
@@ -382,16 +624,21 @@ def get_tier() -> int:
 
     Tier 1 (Discovery):            Python + pip
     Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Chrome + (Claude Code CLI **or** ``OPENAI_API_KEY`` for OpenAI apply)
+    Tier 3 (Full Auto-Apply):       + Chrome + (Claude Code CLI **or** API key for OpenAI-compatible apply)
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_llm = any(
+        os.environ.get(k)
+        for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "LLM_URL")
+    )
     if not has_llm:
         return 1
 
     has_claude = shutil.which("claude") is not None
-    has_openai_apply = bool(os.environ.get("OPENAI_API_KEY"))
+    has_openai_apply = bool(
+        os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    )
     try:
         get_chrome_path()
         has_chrome = True
@@ -419,15 +666,22 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]job_runner init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not any(
+        os.environ.get(k)
+        for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "LLM_URL")
+    ):
+        missing.append(
+            "LLM API key — run [bold]job_runner init[/bold] or set GEMINI_API_KEY / DEEPSEEK_API_KEY"
+        )
     if required >= 3:
         has_claude = shutil.which("claude") is not None
-        has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+        has_openai = bool(
+            os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+        )
         if not has_claude and not has_openai:
             missing.append(
                 "Auto-apply agent: install [bold]claude[/bold] CLI (https://claude.ai/code) "
-                "or set [bold]OPENAI_API_KEY[/bold] for OpenAI apply"
+                "or set [bold]OPENAI_API_KEY[/bold] / [bold]DEEPSEEK_API_KEY[/bold] for API apply"
             )
         try:
             get_chrome_path()

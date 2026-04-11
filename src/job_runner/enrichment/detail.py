@@ -17,7 +17,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -319,6 +319,33 @@ def _normalize_apply_href(href: str | None, page_url: str) -> str | None:
     return h
 
 
+def _extract_direct_application_url(apply_url: str | None, page_url: str | None, site: str | None) -> str | None:
+    """Extract an external (off-board) application URL, mainly for LinkedIn jobs."""
+    raw = (apply_url or "").strip()
+    if not raw:
+        return None
+    site_l = (site or "").lower()
+    page_l = (page_url or "").lower()
+    if "linkedin" not in site_l and "linkedin.com" not in page_l:
+        return None
+    try:
+        p = urlparse(raw)
+        host = (p.netloc or "").lower()
+        if "linkedin.com" not in host:
+            return raw
+        qs = parse_qs(p.query)
+        for key in ("url", "redirect", "redirectUrl", "dest", "destination", "target"):
+            val = (qs.get(key) or [None])[0]
+            if not val:
+                continue
+            v = unquote(str(val).strip())
+            if v.startswith("http://") or v.startswith("https://"):
+                return v
+    except Exception:
+        return None
+    return None
+
+
 APPLY_SELECTORS = [
     # LinkedIn (Easy Apply / external apply anchors)
     'a.jobs-apply-button',
@@ -579,11 +606,12 @@ RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 PERMANENT_FAILURES = {404, 410, 451}
 
 
-def scrape_detail_page(page, url: str) -> dict:
+def scrape_detail_page(page, url: str, site: str | None = None) -> dict:
     """Full cascade for one detail page."""
     result: dict = {
         "full_description": None,
         "application_url": None,
+        "direct_application_url": None,
         "status": "error",
         "tier_used": None,
         "error": None,
@@ -627,6 +655,9 @@ def scrape_detail_page(page, url: str) -> dict:
             n = _normalize_apply_href(str(result["application_url"]), page.url)
             if n:
                 result["application_url"] = n
+        result["direct_application_url"] = _extract_direct_application_url(
+            result.get("application_url"), page.url, site
+        )
         return result
 
     # Tier 2: Deterministic CSS
@@ -643,6 +674,9 @@ def scrape_detail_page(page, url: str) -> dict:
             n = _normalize_apply_href(str(result["application_url"]), page.url)
             if n:
                 result["application_url"] = n
+        result["direct_application_url"] = _extract_direct_application_url(
+            result.get("application_url"), page.url, site
+        )
         return result
 
     tier2_apply = apply
@@ -666,6 +700,9 @@ def scrape_detail_page(page, url: str) -> dict:
         n = _normalize_apply_href(str(result["application_url"]), page.url)
         if n:
             result["application_url"] = n
+    result["direct_application_url"] = _extract_direct_application_url(
+        result.get("application_url"), page.url, site
+    )
     return result
 
 
@@ -708,7 +745,7 @@ def scrape_site_batch(
             for i, (url, title) in enumerate(jobs):
                 log.info("[%d/%d] %s", i + 1, len(jobs), title[:50] if title else url[:50])
 
-                result = scrape_detail_page(page, url)
+                result = scrape_detail_page(page, url, site=site)
                 stats["processed"] += 1
 
                 tier = result.get("tier_used")
@@ -740,9 +777,15 @@ def scrape_site_batch(
                         continue
                     stats[status] += 1
                     conn.execute(
-                        "UPDATE jobs SET full_description = ?, application_url = ?, "
+                        "UPDATE jobs SET full_description = ?, application_url = ?, direct_application_url = ?, "
                         "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
+                        (
+                            result.get("full_description"),
+                            result.get("application_url"),
+                            result.get("direct_application_url"),
+                            now,
+                            url,
+                        ),
                     )
                 else:
                     stats["error"] += 1

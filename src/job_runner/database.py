@@ -73,7 +73,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
                    agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
-                   verification_confidence, application_track
+                   verification_confidence, application_track, apply_ready
 
     Args:
         db_path: Override the default DB_PATH.
@@ -103,6 +103,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
             application_url       TEXT,
+            direct_application_url TEXT,
             detail_scraped_at     TEXT,
             detail_error          TEXT,
 
@@ -161,6 +162,7 @@ _ALL_COLUMNS: dict[str, str] = {
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
+    "direct_application_url": "TEXT",
     "detail_scraped_at": "TEXT",
     "detail_error": "TEXT",
     # Scoring
@@ -186,6 +188,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
     "application_track": "TEXT",
+    "apply_ready": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -222,6 +225,11 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     if added:
         conn.commit()
 
+    if "apply_ready" in added:
+        from job_runner.apply.resume_source import sync_apply_ready_flags
+
+        sync_apply_ready_flags(conn)
+
     return added
 
 
@@ -238,10 +246,13 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         Dictionary with keys:
             total, by_site, pending_detail, with_description,
             scored, unscored, tailored, untailored_eligible,
-            with_cover_letter, applied, score_distribution
+            with_cover_letter, applied, ready_to_apply, score_distribution
     """
     if conn is None:
         conn = get_connection()
+
+    # Ensure migrations (e.g. apply_ready) before queries that depend on newer columns.
+    ensure_columns(conn)
 
     stats: dict = {}
 
@@ -324,9 +335,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE tailored_resume_path IS NOT NULL "
-        "AND applied_at IS NULL "
-        "AND application_url IS NOT NULL"
+        "WHERE apply_ready = 1 AND applied_at IS NULL"
     ).fetchone()[0]
 
     return stats

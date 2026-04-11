@@ -7,8 +7,6 @@ import logging
 import time
 from contextvars import ContextVar
 from datetime import datetime
-from pathlib import Path
-
 from job_runner import config
 from job_runner.apply import launcher as launcher_mod
 from job_runner.apply.cdp_driver import CdpPlaywrightDriver
@@ -21,12 +19,18 @@ from job_runner.apply.deterministic import (
     try_dismiss_cookie_banner,
     try_dismiss_simplify_popup,
     try_linkedin_deterministic,
+    try_linkedin_post_nav_fast,
+    try_dismiss_linkedin_network_modal,
     try_prefill_profile_fields,
     try_progress_recovery_step,
     try_resolve_placeholder_dropdowns,
 )
 from job_runner.apply.field_answers import enrich_form_fields_json_with_profile, save_user_rule
-from job_runner.apply.prompt import build_compact_apply_prompt
+from job_runner.apply.url_resolver import resolve_best_apply_url
+from job_runner.apply.prompt import (
+    COMPACT_APPLY_SYSTEM_PHASES_ONE_LINE,
+    build_compact_apply_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,7 @@ _STUCK_LLM_NUDGE = """The page fingerprint has not changed after deterministic r
 2) browser_form_fields — every row includes current_value, frame_index and frame_url. Greenhouse/Klaviyo embeds are usually frame_index > 0. You MUST pass that same frame_index on every browser_fill / browser_select / browser_upload_file for those rows.
 3) Skip fields where current_value already matches PROFILE / suggested_answer — do not re-fill. If a tool returns skipped: already matches / skipped: already selected, continue.
 4) For each row with tag \"select\" and a suggested_answer, use browser_select with label=suggested_answer (or value= if needed) and the same frame_index/nth/selector — do not skip dropdowns that are still placeholders.
-5) Fill required empty or wrong fields from PROFILE (first/last/preferred name, email, phone). If form_fields returns [], scroll the scrollable application panel on the careers page, wait 500ms, then run form_fields again or try browser_tabs if the form is in another tab.
+5) Fill required empty or wrong fields from PROFILE (first/last/preferred name, email, phone). If form_fields returns [], call browser_clickables to list Apply/Next links (with frame_index), or scroll the application panel, wait 500ms, then form_fields again or browser_tabs if the form is in another tab.
 6) If you truly cannot interact (permission, CAPTCHA, SSO), output RESULT:FAILED:reason. If out of ideas after trying the above, output RESULT:FAILED:stuck."""
 
 
@@ -46,6 +50,10 @@ _VISION_STUCK_NUDGE_TEXT = """Visual fallback: use this screenshot to decide the
 - Identify the exact blocker on the current page (e.g., modal, iframe form, hidden panel, required checkbox/dropdown).
 - Then call the next 1-3 tools to make concrete progress.
 - If form fields are visible, call browser_form_fields and fill required fields immediately (using frame_index when present)."""
+
+_TEXT_STUCK_FALLBACK_INTRO = """Stuck recovery (text-only — no screenshot available for this API).
+Use the URL and visible text below, then call the next 1-3 tools: browser_clickables to find Apply/Next/Dismiss,
+browser_tabs if a popup tab opened, browser_wait_ms if the page is still loading, then browser_form_fields again."""
 
 _OPENAI_41_MINI_IN = 0.40e-6
 _OPENAI_41_MINI_OUT = 1.60e-6
@@ -88,7 +96,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "browser_snapshot",
-            "description": "Return visible page text (truncated) for planning next actions.",
+            "description": (
+                "Return visible text from the page (innerText, truncated) — not raw HTML. "
+                "Use for headings, errors, and button labels; pair with browser_form_fields or browser_clickables."
+            ),
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -96,7 +107,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "browser_click",
-            "description": "Click an element via CSS selector or accessibility role+name.",
+            "description": (
+                "Click via CSS selector, or role+name / role+name_contains (Playwright). "
+                "Prefer name_contains for partial labels (e.g. Apply, Next). Use frame_index inside iframes."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -176,6 +190,17 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "browser_clickables",
+            "description": (
+                "List visible links and buttons in all frames (tag, name, href, frame_index). "
+                "Use when form_fields is empty or you need to find Apply/Next/Continue by label."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "field_answer_save",
             "description": (
                 "Save a regex pattern → answer for future runs (writes ~/.job_runner/field_answers.yaml). "
@@ -242,11 +267,24 @@ TOOLS = [
 
 def _run_tool(driver: CdpPlaywrightDriver, name: str, args: dict) -> str:
     try:
+        fast = config.get_apply_fast_mode()
         if name == "browser_navigate":
             out = driver.navigate(args["url"])
-            try_dismiss_simplify_popup(driver)
-            try_dismiss_cookie_banner(driver)
-            try_resolve_placeholder_dropdowns(driver)
+            try:
+                cur = (driver.page.url if driver.page is not None else "") or ""
+            except Exception:
+                cur = ""
+            logger.info("Tool browser_navigate -> %s", (cur or str(args.get("url", "")))[:220])
+            if not fast:
+                try_dismiss_simplify_popup(driver)
+                try_dismiss_cookie_banner(driver)
+                try_resolve_placeholder_dropdowns(driver)
+            else:
+                u = str(args.get("url") or "")
+                if "linkedin.com" in u.lower():
+                    driver.wait_ms(500)
+                    try_dismiss_cookie_banner(driver)
+                    try_dismiss_linkedin_network_modal(driver)
             return out
         if name == "browser_snapshot":
             return driver.snapshot()
@@ -258,8 +296,9 @@ def _run_tool(driver: CdpPlaywrightDriver, name: str, args: dict) -> str:
                 name_contains=args.get("name_contains"),
                 frame_index=_opt_frame_index(args),
             )
-            try_dismiss_simplify_popup(driver)
-            try_resolve_placeholder_dropdowns(driver)
+            if not fast:
+                try_dismiss_simplify_popup(driver)
+                try_resolve_placeholder_dropdowns(driver)
             return out
         if name == "browser_select":
             sel = args.get("selector")
@@ -290,7 +329,8 @@ def _run_tool(driver: CdpPlaywrightDriver, name: str, args: dict) -> str:
                 )
             else:
                 return "error: provide index, label, or value for browser_select"
-            try_resolve_placeholder_dropdowns(driver)
+            if not fast:
+                try_resolve_placeholder_dropdowns(driver)
             return out
         if name == "browser_fill":
             return driver.fill(
@@ -302,9 +342,24 @@ def _run_tool(driver: CdpPlaywrightDriver, name: str, args: dict) -> str:
         if name == "browser_form_fields":
             raw = driver.form_fields()
             prof = _apply_profile.get()
-            out = enrich_form_fields_json_with_profile(raw, prof)
-            try_resolve_placeholder_dropdowns(driver)
+            if fast:
+                out = raw
+                try:
+                    if not json.loads(raw or "[]"):
+                        out = (
+                            raw
+                            + "\n\nNote: No fields returned. Try browser_clickables, browser_tabs, "
+                            "browser_wait_ms(800), then form_fields again."
+                        )
+                except json.JSONDecodeError:
+                    pass
+            else:
+                out = enrich_form_fields_json_with_profile(raw, prof)
+            if not fast:
+                try_resolve_placeholder_dropdowns(driver)
             return out
+        if name == "browser_clickables":
+            return driver.clickables_summary()
         if name == "field_answer_save":
             return save_user_rule(
                 str(args.get("pattern", "")),
@@ -417,6 +472,26 @@ def _append_vision_stuck_nudge(messages: list[dict], driver: CdpPlaywrightDriver
     return True
 
 
+def _append_text_stuck_fallback(messages: list[dict], driver: CdpPlaywrightDriver) -> bool:
+    """When vision nudges are unavailable (e.g. DeepSeek), inject URL + visible text for recovery."""
+    try:
+        url = (driver.page.url or "").strip() if driver.page else ""
+        snap = driver.snapshot(12_000)
+    except Exception:
+        return False
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"{_TEXT_STUCK_FALLBACK_INTRO}\n\n"
+                f"current_url:\n{url}\n\n"
+                f"visible_text:\n{snap}"
+            ),
+        }
+    )
+    return True
+
+
 def _field_key(selector: str, nth: int, frame_index: int | None) -> str:
     fi = -1 if frame_index is None else int(frame_index)
     return f"{selector}||{int(nth)}||{fi}"
@@ -442,7 +517,7 @@ def _record_prefill_gap_candidate(
         "ts": datetime.now().isoformat(timespec="seconds"),
         "worker_id": worker_id,
         "tool": tool_name,
-        "job_url": job.get("application_url") or job.get("url"),
+        "job_url": job.get("direct_application_url") or job.get("application_url") or job.get("url"),
         "job_title": job.get("title", ""),
         "site": job.get("site", ""),
         "selector": selector,
@@ -529,21 +604,20 @@ def run_job_openai(
 
     profile = config.load_profile()
     _prof_tok = _apply_profile.set(profile)
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
 
     driver = CdpPlaywrightDriver(f"http://127.0.0.1:{port}")
     start = time.time()
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    best_apply_url, inferred_direct = resolve_best_apply_url(job)
+    if inferred_direct and not (job.get("direct_application_url") or "").strip():
+        job["direct_application_url"] = inferred_direct
+
     log_header = (
         f"\n{'=' * 60}\n"
         f"[{ts_header}] (openai) {job['title']} @ {job.get('site', '')}\n"
-        f"URL: {job.get('application_url') or job['url']}\n"
+        f"URL: {best_apply_url}\n"
         f"Model: {model}\n"
         f"{'=' * 60}\n"
     )
@@ -554,10 +628,35 @@ def run_job_openai(
         update_state(worker_id, total_cost=prev + delta)
 
     try:
+        logger.info("[worker-%d] OpenAI apply starting for: %s", worker_id, job.get("title", "")[:80])
         driver.connect()
-        apply_url = job.get("application_url") or job["url"]
+        logger.info("[worker-%d] CDP connected on port %d", worker_id, port)
+        apply_url = best_apply_url
+        fast = config.get_apply_fast_mode()
 
-        if config.get_apply_deterministic_first():
+        # Fast path: one navigation to the application URL, then LLM tools only (no deterministic prefill).
+        if fast:
+            try:
+                logger.info("[worker-%d] Navigating to apply URL…", worker_id)
+                driver.navigate(apply_url)
+            except Exception as exc:
+                logger.warning("Fast apply: initial navigate failed: %s", exc)
+            else:
+                logger.info("[worker-%d] Navigation loaded; checking quick LinkedIn path", worker_id)
+                early_li = try_linkedin_post_nav_fast(driver, apply_url=apply_url)
+                if early_li:
+                    duration_ms = int((time.time() - start) * 1000)
+                    with open(worker_log, "a", encoding="utf-8") as lf:
+                        lf.write(log_header)
+                        lf.write(early_li + "\n")
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    outp = (
+                        config.LOG_DIR
+                        / f"openai_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+                    )
+                    outp.write_text(early_li, encoding="utf-8")
+                    return _map_result_line(early_li), duration_ms
+        elif config.get_apply_deterministic_first():
             early = try_linkedin_deterministic(
                 driver, apply_url=apply_url, dry_run=dry_run
             )
@@ -575,26 +674,30 @@ def run_job_openai(
             try_prefill_profile_fields(driver, profile)
             try_apply_field_rules_to_dropdowns(driver, profile)
 
-        compact = build_compact_apply_prompt(job, resume_text, dry_run=dry_run)
-        api_key = config.get_apply_openai_api_key()
-        base_url = config.get_apply_openai_base_url()
-        if not api_key:
-            raise RuntimeError(
-                "OpenAI-compatible apply agent key missing. Set JOB_RUNNER_APPLY_OPENAI_API_KEY "
-                "or OPENAI_API_KEY in ~/.job_runner/.env."
-            )
+        compact = build_compact_apply_prompt(job, dry_run=dry_run)
+        api_key, base_url = config.resolve_apply_openai_client(model)
         client = OpenAI(api_key=api_key, base_url=base_url)
         max_turns = config.get_apply_openai_max_turns()
+        req_timeout = config.get_apply_openai_request_timeout_seconds()
 
+        if fast:
+            sys_msg = (
+                "You control the browser via tools. Work efficiently: open Apply, upload the resume PDF path "
+                "given in the prompt, then fill required fields using profile + resume text. "
+                "Prefer browser_form_fields when you need selectors; use browser_clickables if form_fields is "
+                "empty but you need Apply/Next. Avoid redundant snapshots. "
+                + COMPACT_APPLY_SYSTEM_PHASES_ONE_LINE
+                + " End with exactly one line RESULT:…"
+            )
+        else:
+            sys_msg = (
+                "You are a job-application browser agent. Use tools to operate the page. "
+                "Fill application forms from the profile and resume; use browser_form_fields on each step. "
+                + COMPACT_APPLY_SYSTEM_PHASES_ONE_LINE
+                + " Be concise. When finished, include exactly one line: RESULT:…"
+            )
         messages: list[dict] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a job-application browser agent. Use tools to operate the page. "
-                    "Fill application forms from the profile and resume; use browser_form_fields on each step. "
-                    "Be concise. When finished, include exactly one line: RESULT:…"
-                ),
-            },
+            {"role": "system", "content": sys_msg},
             {"role": "user", "content": compact},
         ]
 
@@ -612,6 +715,8 @@ def run_job_openai(
 
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
+            if fast:
+                lf.write("  >> apply_fast_mode=1 (LLM-first; no deterministic prefill/recovery)\n")
 
         final_text = ""
         apply_clicked = is_application_form_ready(driver)
@@ -619,7 +724,8 @@ def run_job_openai(
         stall_turns = 0
         stuck_llm_nudge_sent = False
         recovery_no_change_count = 0
-        vision_stuck_nudge_sent = False
+        stuck_rich_context_sent = False
+        no_tool_turns = 0
         field_hints: dict[str, dict] = {}
         for turn in range(max_turns):
             if launcher_mod._stop_event.is_set():
@@ -629,8 +735,8 @@ def run_job_openai(
             stall_turns = stall_turns + 1 if cur_fp == last_fp else 0
             last_fp = cur_fp
 
-            # Deterministic-first unstick policy before another model turn.
-            if stall_turns >= 2:
+            # Slow path: deterministic recovery between LLM rounds (adds latency).
+            if not fast and stall_turns >= 2:
                 pre_recovery_fp = _page_fingerprint(driver)
                 did_move = try_progress_recovery_step(driver, apply_url, profile=profile)
                 post_recovery_fp = _page_fingerprint(driver)
@@ -653,28 +759,72 @@ def run_job_openai(
                     )
                     continue
                 recovery_no_change_count += 1
-                # Same LLM as every other turn — no separate "backup". Add explicit stuck guidance once.
                 if not stuck_llm_nudge_sent:
                     messages.append({"role": "user", "content": _STUCK_LLM_NUDGE})
                     stuck_llm_nudge_sent = True
                     with open(worker_log, "a", encoding="utf-8") as lf:
                         lf.write("  >> stuck_llm_nudge\n")
-                # If two recovery attempts did not materially change page state, force visual fallback.
-                if recovery_no_change_count >= 2 and not vision_stuck_nudge_sent:
-                    if _append_vision_stuck_nudge(messages, driver):
-                        vision_stuck_nudge_sent = True
+                if recovery_no_change_count >= 2 and not stuck_rich_context_sent:
+                    if config.get_apply_vision_stuck_nudge(model) and _append_vision_stuck_nudge(
+                        messages, driver
+                    ):
+                        stuck_rich_context_sent = True
                         with open(worker_log, "a", encoding="utf-8") as lf:
                             lf.write("  >> vision_stuck_nudge\n")
+                    elif _append_text_stuck_fallback(messages, driver):
+                        stuck_rich_context_sent = True
+                        with open(worker_log, "a", encoding="utf-8") as lf:
+                            lf.write("  >> text_stuck_fallback\n")
+            elif (
+                fast
+                and 8 <= stall_turns < 10
+                and not config.get_apply_vision_stuck_nudge(model)
+                and not stuck_rich_context_sent
+            ):
+                if _append_text_stuck_fallback(messages, driver):
+                    stuck_rich_context_sent = True
+                    with open(worker_log, "a", encoding="utf-8") as lf:
+                        lf.write("  >> text_stuck_fallback (fast, no-vision)\n")
+            elif fast and stall_turns >= 6 and not stuck_llm_nudge_sent:
+                messages.append({"role": "user", "content": _STUCK_LLM_NUDGE})
+                stuck_llm_nudge_sent = True
+                with open(worker_log, "a", encoding="utf-8") as lf:
+                    lf.write("  >> stuck_llm_nudge (fast)\n")
+            elif fast and stall_turns >= 10 and not stuck_rich_context_sent:
+                if config.get_apply_vision_stuck_nudge(model) and _append_vision_stuck_nudge(
+                    messages, driver
+                ):
+                    stuck_rich_context_sent = True
+                    with open(worker_log, "a", encoding="utf-8") as lf:
+                        lf.write("  >> vision_stuck_nudge (fast)\n")
+                elif _append_text_stuck_fallback(messages, driver):
+                    stuck_rich_context_sent = True
+                    with open(worker_log, "a", encoding="utf-8") as lf:
+                        lf.write("  >> text_stuck_fallback (fast)\n")
 
-            try_dismiss_simplify_popup(driver)
+            if not fast or (turn % 4 == 0):
+                try_dismiss_simplify_popup(driver)
 
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.15,
+            logger.info(
+                "[worker-%d] Waiting for model response (turn %d/%d, timeout %.0fs)…",
+                worker_id,
+                turn + 1,
+                max_turns,
+                req_timeout,
             )
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0.1 if fast else 0.15,
+                    timeout=req_timeout,
+                )
+            except Exception as exc:
+                logger.warning("[worker-%d] Model request failed: %s", worker_id, exc)
+                raise
+            logger.info("[worker-%d] Model response received (turn %d)", worker_id, turn + 1)
             if resp.usage:
                 _bump_cost(_estimate_cost_usd(model, resp.usage))
                 record_llm_usage(
@@ -711,8 +861,39 @@ def run_job_openai(
                     break
 
             if not msg.tool_calls:
+                no_tool_turns += 1
                 if _parse_terminal_line(final_text):
                     break
+                if fast and no_tool_turns >= 2:
+                    # DeepSeek/fast mode can occasionally loop with plain text responses.
+                    # Force fresh browser context into the next turn so the model resumes tool usage.
+                    pre_fp = _page_fingerprint(driver)
+                    did_move = try_progress_recovery_step(driver, apply_url, profile=profile)
+                    post_fp = _page_fingerprint(driver)
+                    if did_move and post_fp != pre_fp:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "A deterministic recovery step was auto-run because no tools were called. "
+                                    "Continue from the current page and call tools now."
+                                ),
+                            }
+                        )
+                        continue
+                    tabs = _run_tool(driver, "browser_tabs", {"action": "list"})
+                    clickables = _run_tool(driver, "browser_clickables", {})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "No tool calls were made for multiple turns. "
+                                "Here is fresh browser context; now call 1-3 tools to progress.\n\n"
+                                f"TABS:\n{tabs[:2500]}\n\n"
+                                f"CLICKABLES:\n{clickables[:4000]}"
+                            ),
+                        }
+                    )
                 messages.append(
                     {
                         "role": "user",
@@ -720,18 +901,19 @@ def run_job_openai(
                     }
                 )
                 continue
+            no_tool_turns = 0
 
             for tc in msg.tool_calls:
                 name = tc.function.name
                 if name == "browser_click":
                     apply_clicked = True
                 if name == "browser_fill" and not apply_clicked:
-                    # If form fields are already visible, skip deterministic apply-click path.
                     if is_application_form_ready(driver):
                         apply_clicked = True
-                    else:
-                        # Prevent premature filling before opening an application modal/page.
+                    elif not fast:
                         try_apply_flow_for_job_url(driver, apply_url)
+                        apply_clicked = True
+                    else:
                         apply_clicked = True
                 try:
                     args = json.loads(tc.function.arguments or "{}")
@@ -784,7 +966,21 @@ def run_job_openai(
 
         line = _parse_terminal_line(final_text or "")
         if not line:
-            return "failed:no_result_line", duration_ms
+            try:
+                cur_url = (driver.page.url if driver.page is not None else "") or ""
+            except Exception:
+                cur_url = ""
+            ws = get_state(worker_id)
+            actions = int(ws.actions) if ws and ws.actions is not None else 0
+            line = "RESULT:FAILED:max_turns_no_result_line"
+            with open(worker_log, "a", encoding="utf-8") as lf:
+                lf.write(
+                    "  >> synthetic_result_fallback: "
+                    f"{line} (turns={max_turns}, actions={actions}, url={cur_url[:220]})\n"
+                )
+            final_text = (final_text or "").rstrip()
+            final_text = f"{final_text}\n{line}" if final_text else line
+            out_path.write_text(final_text, encoding="utf-8")
         mapped = _map_result_line(line)
         # Stricter success criteria: only mark applied if we can observe post-submit evidence.
         if mapped == "applied":
